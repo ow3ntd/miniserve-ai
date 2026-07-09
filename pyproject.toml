@@ -1,0 +1,13 @@
+[project]
+name = "miniserve-ai"
+version = "0.1.0.dev0"
+description = "A concurrent request scheduler with a pluggable model backend: C++ bounded-queue core, async dynamic batching, and statistically rigorous benchmarks."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Owen" }]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+# Keep pytest rooted at the repo so `from app.main import ...` resolves.
+pythonpath = ["."]

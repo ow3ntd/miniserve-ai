@@ -1,0 +1,7 @@
+# Day 1 dependencies only. PyTorch (Day 2) and pybind11 (Day 1.5) added when needed.
+fastapi==0.139.0
+uvicorn[standard]==0.51.0
+
+# Test dependencies
+pytest==9.1.1
+httpx==0.28.1

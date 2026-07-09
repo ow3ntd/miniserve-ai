@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+dist/
+
+# C++ / CMake (Day 1.5+)
+build/
+*.so
+*.o
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
