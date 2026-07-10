@@ -4,7 +4,7 @@
 
 The model is incidental; the scheduler is the point.
 
-> **Status: v0.1 in progress — Day 1 (scaffold + health endpoint).** Everything below marked *(planned)* does not exist yet. This README will only ever describe what has actually been built and measured.
+> **Status: v0.1 in progress — Day 2 (model runner) complete; C++ queue core (Day 1.5) deferred pending a macOS toolchain update.** Everything below marked *(planned)* does not exist yet. This README will only ever describe what has actually been built and measured.
 
 ## Why this project exists
 
@@ -32,7 +32,7 @@ Diagram to be replaced with the real one once the boundary exists (Day 6–7).
 
 - [x] Health endpoint (`GET /health`)
 - [ ] C++ bounded, thread-safe queue with pybind11 bindings *(Day 1.5)*
-- [ ] Model runner abstraction with explicit batch assembly/splitting *(Day 2)*
+- [x] Model runner abstraction with explicit batch assembly/splitting and a padding-leak invariance test *(Day 2)*
 - [ ] `POST /predict` *(Day 3)*
 - [ ] Async scheduler with dynamic batching (`max_batch_size`, `max_wait_ms`) *(Days 6–9)*
 - [ ] Deliberate concurrency bug hunt, documented in `docs/concurrency_bugs.md` *(Day 10)*

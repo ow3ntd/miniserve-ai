@@ -1,6 +1,7 @@
-# Day 1 dependencies only. PyTorch (Day 2) and pybind11 (Day 1.5) added when needed.
+# pybind11 (Day 1.5) added when the C++ core lands.
 fastapi==0.139.0
 uvicorn[standard]==0.51.0
+torch==2.13.0
 
 # Test dependencies
 pytest==9.1.1
