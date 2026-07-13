@@ -28,5 +28,7 @@ def test_health_reports_nonnegative_uptime():
 
 
 def test_unknown_route_returns_404():
-    resp = make_client().get("/predict")  # does not exist yet (Day 3)
+    # /predict exists as of Day 3 (GET against it is a 405, covered in
+    # test_predict.py), so use a route that will never exist.
+    resp = make_client().get("/does-not-exist")
     assert resp.status_code == 404

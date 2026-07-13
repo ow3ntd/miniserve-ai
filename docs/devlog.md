@@ -6,6 +6,104 @@ retroactive polish.
 
 ---
 
+## 2026-07-11 — Day 3: synchronous /predict endpoint
+
+**Done**
+
+- `app/schemas.py`: `PredictRequest` (non-empty `list[int]`, unknown
+  fields rejected) and `PredictResponse` (`outputs: list[float]`).
+- `app/main.py`: `create_app()` now builds and eagerly loads a
+  `ModelRunner` (or accepts an injected one for tests) and exposes
+  `POST /predict` — a batch of one, run inline. This is the "before"
+  picture the Day 4 baseline benchmark measures.
+- `tests/test_predict.py`: 12 tests covering the happy path (status,
+  output shape, determinism, exact agreement with a directly-invoked
+  runner), structural 422s (empty/missing/mistyped/unknown fields),
+  model-dependent 422s (out-of-vocab token), 503 on an unloaded runner,
+  and 405 on GET.
+
+**Decisions**
+
+- **Validation split across two layers, deliberately.** Structural
+  validation (presence, types, non-empty) lives in Pydantic and never
+  reaches app code; model-dependent validation (vocab range) stays in
+  `ModelRunner._validate()`, since the runner owns the vocab size.
+  The endpoint translates the runner's `ValueError` into a 422 so both
+  layers look identical to clients. The alternative — duplicating the
+  vocab bound in the schema — creates two sources of truth that can
+  drift.
+- **`extra = "forbid"` on the request schema.** A typo'd field name
+  should fail loudly as a 422, not be silently ignored.
+- **Eager model load inside `create_app()` rather than a lifespan
+  hook.** Keeps the factory self-contained and lets tests use
+  `TestClient` without a context manager (lifespan hooks only run when
+  the client is entered as one). Revisit at Day 6: the scheduler needs
+  real startup/shutdown ordering, and load-time work moves to a
+  lifespan context then.
+- **`def`, not `async def`, for the handler.** FastAPI runs sync
+  handlers in its threadpool, so the (CPU-bound) model call doesn't
+  stall the event loop — and the endpoint makes no async promises it
+  can't keep. The scheduler replaces this path entirely.
+- **503 vs 422 boundary.** An unloaded model is a server-side readiness
+  problem (503); everything the client can fix is a 422.
+
+**Next**
+
+- Day 4: baseline benchmark of this unbatched path (rps, p50/p95/p99,
+  error rate; 5+ trials; environment logged to `results/environment.md`)
+  — or Day 1.5 (C++ bounded queue) if the macOS update happens first.
+
+---
+
+## 2026-07-11 — Day 3: synchronous /predict endpoint
+
+**Done**
+
+- `app/schemas.py`: `PredictRequest` (non-empty `list[int]`, unknown
+  fields rejected) and `PredictResponse` (`outputs: list[float]`).
+- `app/main.py`: `create_app()` now builds and eagerly loads a
+  `ModelRunner` (or accepts an injected one for tests) and exposes
+  `POST /predict` — a batch of one, run inline. This is the "before"
+  picture the Day 4 baseline benchmark measures.
+- `tests/test_predict.py`: 12 tests covering the happy path (status,
+  output shape, determinism, exact agreement with a directly-invoked
+  runner), structural 422s (empty/missing/mistyped/unknown fields),
+  model-dependent 422s (out-of-vocab token), 503 on an unloaded runner,
+  and 405 on GET.
+
+**Decisions**
+
+- **Validation split across two layers, deliberately.** Structural
+  validation (presence, types, non-empty) lives in Pydantic and never
+  reaches app code; model-dependent validation (vocab range) stays in
+  `ModelRunner._validate()`, since the runner owns the vocab size.
+  The endpoint translates the runner's `ValueError` into a 422 so both
+  layers look identical to clients. The alternative — duplicating the
+  vocab bound in the schema — creates two sources of truth that can
+  drift.
+- **`extra = "forbid"` on the request schema.** A typo'd field name
+  should fail loudly as a 422, not be silently ignored.
+- **Eager model load inside `create_app()` rather than a lifespan
+  hook.** Keeps the factory self-contained and lets tests use
+  `TestClient` without a context manager (lifespan hooks only run when
+  the client is entered as one). Revisit at Day 6: the scheduler needs
+  real startup/shutdown ordering, and load-time work moves to a
+  lifespan context then.
+- **`def`, not `async def`, for the handler.** FastAPI runs sync
+  handlers in its threadpool, so the (CPU-bound) model call doesn't
+  stall the event loop — and the endpoint makes no async promises it
+  can't keep. The scheduler replaces this path entirely.
+- **503 vs 422 boundary.** An unloaded model is a server-side readiness
+  problem (503); everything the client can fix is a 422.
+
+**Next**
+
+- Day 4: baseline benchmark of this unbatched path (rps, p50/p95/p99,
+  error rate; 5+ trials; environment logged to `results/environment.md`)
+  — or Day 1.5 (C++ bounded queue) if the macOS update happens first.
+
+---
+
 ## 2026-07-09 — Day 2: model runner abstraction
 
 **Done**
