@@ -6,6 +6,51 @@ retroactive polish.
 
 ---
 
+## 2026-07-14 — Day 4: baseline benchmark (no batching)
+
+**Done**
+
+- `load_tests/load_test.py`: closed-loop async load generator (httpx +
+  asyncio), CLI args for url/concurrency/requests/trials/warmup,
+  nearest-rank percentiles, per-trial rows plus mean ± stddev across
+  trials, cold-start captured separately from steady state.
+- `results/environment.md`: Apple M4, 10 cores, 24 GB, macOS 26.2,
+  Python 3.12, pinned package versions, exact server invocation.
+- `results/benchmark_summary.md` + `results/performance_history.md`
+  with measured v0.1 baseline:
+  - c=1: 1583.8 ± 59.2 req/s, p50 0.61 ms, p99 0.96 ms, 0 errors
+  - c=8: 1712.2 ± 47.2 req/s, p50 3.09 ms, p99 23.25 ms, 0 errors
+  - cold start 25.55 ms (~40x steady-state p50)
+
+**Observations**
+
+- 8x concurrency bought ~8% throughput and a ~5x p50 increase; p99 went
+  from <1 ms to ~23 ms. Server saturates ~1,700 req/s; past that,
+  concurrency converts to queueing delay. Little's Law closes:
+  1712 req/s x ~4.7 ms in-system ≈ 8 in flight = the 8 workers.
+- This is the "before" picture: per-request model invocation pays full
+  overhead 8x for work one batched pass could amortize. Days 6–9 exist
+  to beat this table.
+
+**Decisions**
+
+- **Closed-loop generator first.** Offered load adapts to server speed,
+  which is the right shape for a baseline; open-loop (fixed arrival
+  rate) is deferred to the scheduler experiments where overload is the
+  point. The distinction is recorded in the methodology preamble.
+- **5 trials, mean ± stddev, warmup excluded, benchmark on AC power,
+  no access logging.** Same rigor bar as lob-latency-lab; single-run
+  numbers don't go in results files.
+- **Nearest-rank percentiles** over interpolation: simple, defensible,
+  and stable at these sample sizes.
+
+**Next**
+
+- Day 1.5 (C++ bounded queue): macOS update has landed (26.2), so the
+  toolchain blocker should be gone — verify clang/CMake, then build the
+  queue core. Then Day 5 scheduler design doc.
+---
+
 ## 2026-07-11 — Day 3: synchronous /predict endpoint
 
 **Done**
