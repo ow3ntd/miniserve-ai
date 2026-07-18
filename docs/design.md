@@ -12,9 +12,40 @@ semantics — is implemented in C++ and exposed to Python via pybind11. Python
 
 ## 2. Request lifecycle
 
-TBD (Day 5, scheduler design doc). Will cover: request admission → queue →
-batch formation → inference → result routing to per-request futures →
-response, including every failure exit (rejection, timeout, shutdown).
+*(Written Day 5, before scheduler implementation.)*
+
+Every request is represented by exactly one per-request future, created at
+admission and **resolved exactly once** — with a result or with an error.
+That single-resolution rule is the central invariant of the design; every
+state transition below names which party resolves the future.
+
+States and transitions:
+
+                ┌────────────────────────────────────────────────┐
+                │              (queue full) ──► REJECTED 503     │
+    arrival ──► ADMITTED ──► QUEUED ──► FORMING ──► EXECUTING ──► COMPLETED 200
+                │              │            │            │
+                │              │ (deadline) │ (deadline) │ (deadline passed
+                │              ▼            ▼            ▼  during inference)
+                │           EXPIRED 504  EXPIRED 504  EXPIRED 504 (result discarded)
+                │
+                └── (shutting down) ──► REJECTED 503
+
+- **ADMITTED** — request passed schema validation; deadline computed as
+  `arrival + request_timeout` on the monotonic clock. A future is created.
+- **QUEUED** — pushed into the bounded queue. If the queue is full, the
+  request is instead rejected immediately (503; see §6.1) and its future
+  resolved with the rejection.
+- **FORMING** — the worker has popped it into a batch under formation.
+  Requests whose deadline has already expired are filtered out here,
+  resolved with 504, and **never enter execution** (see §6.2).
+- **EXECUTING** — part of a batch inside `ModelRunner.predict()`.
+- **COMPLETED** — row *i* of the batch output is routed back to request
+  *i*'s future (the ordering contract from §4) and the future resolves 200.
+- A request whose deadline passes **during** inference still completes the
+  forward pass (a running batch cannot be aborted mid-matmul), but its
+  caller receives 504 and the computed result is discarded — deadline
+  semantics are honored over sunk cost.
 
 ## 3. Why the queue core lives in C++
 
@@ -48,8 +79,8 @@ mathematically irrelevant (its embedding is zeroed), so `PAD_ID = 0` can
 also legitimately appear as a real token.
 
 **Disassembly and ordering.** The model returns `[B, n_outputs]`; row *i*
-belongs to request *i*. That ordering is the contract the future scheduler
-will rely on to route each result back to the correct caller's future.
+belongs to request *i*. That ordering is the contract the scheduler relies
+on to route each result back to the correct caller's future.
 `_disassemble` converts to plain Python floats so nothing above the runner
 ever handles tensors.
 
@@ -67,14 +98,134 @@ Everything runs on CPU under `torch.inference_mode()`.
 
 ## 5. Batching design
 
-TBD (Days 5, 8–9). Will cover: `max_batch_size`, `max_wait_ms`, the
-latency/throughput tradeoff with measured numbers, and the race between
-batch-timeout timers and producers.
+*(Written Day 5, before scheduler implementation.)*
+
+Two parameters govern batch formation:
+
+- **`max_batch_size`** — hard cap on requests per batch.
+- **`max_wait_ms`** — how long a partially filled batch may wait for more
+  requests before executing anyway.
+
+Formation rule: the worker pops requests into a forming batch. The batch
+window opens when the first request enters the empty batch; the batch is
+dispatched when **either** it reaches `max_batch_size` **or** the window
+has been open `max_wait_ms` — whichever comes first. Deadline-expired
+requests are filtered at formation (§2) and do not count toward batch
+size.
+
+The tradeoff, stated against measured numbers (Day 4 baseline,
+`results/benchmark_summary.md`): unbatched, this system saturates at
+~1,700 req/s with p99 exploding to ~23 ms at concurrency 8 — every request
+pays full per-invocation overhead. Batching amortizes that overhead across
+the batch at the cost of up to `max_wait_ms` of added latency for the
+first request in a window. `max_wait_ms` therefore buys throughput with
+p50 latency; the batching benchmarks (Day 13 in the plan) measure that
+exchange rate explicitly rather than asserting it.
+
+The race between the `max_wait_ms` timer and concurrent producers (a batch
+dispatching while a request is mid-push) is a known hazard; it is a
+primary target of the deliberate bug hunt (Day 10) and its resolution will
+be documented in §8.
 
 ## 6. Backpressure, timeouts, and graceful shutdown
 
-TBD (Days 5, 11–12). Will cover: bounded queue rejection (503) semantics,
-per-request timeout without orphaned futures, and SIGTERM drain behavior.
+*(Written Day 5. Decisions 6.1–6.3 were made before implementation;
+rationale recorded at decision time, not retrofitted.)*
+
+### 6.1 Backpressure: reject instantly on full queue (503)
+
+When a request arrives and the queue holds `max_queue_size` entries, the
+server rejects it **immediately** with HTTP 503 — no waiting for a slot.
+
+Rationale: this is explicit backpressure. An instant 503 is the fastest
+possible signal for a client to back off or retry elsewhere; a brief
+blocking wait would absorb micro-bursts but muddies latency accounting
+(time-to-503 becomes load-dependent) and hides the overload signal the
+metric exists to expose. Bounded queue + instant rejection also caps
+memory at a known constant. Every rejection increments
+`queue_full_count`.
+
+### 6.2 Timeout: deadline starts at arrival (504)
+
+The request deadline is `arrival_time + request_timeout` on the monotonic
+clock. Queue wait, batching delay, and inference execution all count
+against it. A request whose deadline expires while queued is **never
+executed**: it is filtered at batch formation and resolved with HTTP 504.
+
+Rationale: the client experiences one number — time since it sent the
+request — so the server's deadline must be measured on the same clock, or
+"timeout" stops meaning anything under load. Starting the clock at dequeue
+would allow a request to sit in queue indefinitely and still "not time
+out," which is precisely the pathological regime Day 4 measured (queueing
+delay, not compute, dominating tail latency). Never-execute-expired also
+protects a saturated server from spending compute on responses no one is
+waiting for — under overload, that wasted work is what turns saturation
+into collapse.
+
+### 6.3 Shutdown: bounded drain (503 for the queue)
+
+On SIGTERM the server: (1) stops admitting new requests (503), (2) allows
+the currently executing batch to finish, (3) resolves every remaining
+queued request's future with HTTP 503, then exits.
+
+Rationale: shutdown time is bounded by one batch execution — predictable
+for process supervisors — while draining the whole queue would make
+shutdown time unbounded under load. Queued-but-unstarted work is safe to
+reject (the client gets an honest retryable signal); in-flight work is
+finished because aborting mid-batch would discard compute already spent.
+**No request future may remain unresolved at exit** — an orphaned future
+is a hung client, and the shutdown-drain test exists to prove this
+invariant.
+
+### 6.4 HTTP status behavior
+
+| Status | Meaning | Producer |
+|---|---|---|
+| 200 | prediction returned | scheduler → future |
+| 422 | invalid request (schema or vocab) | Pydantic / endpoint |
+| 503 `queue full` | backpressure rejection at admission | scheduler admission |
+| 503 `shutting down` | rejected at admission, or queued at shutdown | scheduler admission / drain |
+| 503 `model not loaded` | readiness failure | endpoint |
+| 504 | deadline expired (queued, at formation, or during inference) | scheduler |
+| 500 | unexpected execution failure | scheduler → future |
+
+### 6.5 Metrics affected
+
+`queue_full_count`, `timeout_count` (504s), `shutdown_rejected_count`,
+current queue depth, queue-wait time and inference time (decomposed —
+§6.2 makes queue wait a first-class component of user-visible latency),
+batch size history. Full metrics design: §7 (Day 13).
+
+### 6.6 Invariants
+
+1. Every future is resolved exactly once (200, 503, 504, or 500; 422
+   never reaches the scheduler).
+2. No deadline-expired request enters model execution.
+3. Queue depth never exceeds `max_queue_size`.
+4. All deadlines use the monotonic clock; wall-clock jumps cannot expire
+   or resurrect requests.
+5. Shutdown completes in bounded time: ≤ one batch execution plus queue
+   drain (rejections are O(1) each).
+6. After shutdown begins, no new request is admitted.
+
+### 6.7 Edge cases
+
+- **Deadline expires between admission and enqueue** (pathologically small
+  timeout): filtered at formation like any expired request; 504.
+- **Entire forming batch expired**: skip execution entirely; resolve all
+  with 504; worker proceeds to next batch.
+- **Shutdown during an open batch window**: the partial batch executes
+  (it is "currently executing" the moment the drain begins); the queue
+  behind it is rejected.
+- **Repeated SIGTERM**: idempotent; the drain runs once.
+- **Queue-full race with a just-freed slot**: a request may see "full"
+  while a slot frees concurrently. Accepted: the 503 is still honest at
+  the instant it was issued. The reverse race (accept then find no slot)
+  must be impossible — admission and enqueue must be atomic in the C++
+  core. Treated fully in the Day 10 bug hunt.
+- **Client disconnects while queued**: v0.1 does not detect this; the
+  request executes and the result is discarded at the response layer.
+  Recorded as a limitation (§10).
 
 ## 7. Metrics and tracing
 
@@ -88,10 +239,14 @@ TBD (Day 10). Summary here; full root-cause writeups in
 
 ## 9. Benchmark methodology
 
-TBD (Day 4). Will restate the rigor requirements (trial counts, warm/cold
-separation, load shape, environment logging) and link `results/`.
+*(Day 4.)* Methodology — closed-loop generator, 5+ trials with mean ±
+stddev, warmup-excluded steady state, cold-start reported separately,
+environment logging, AC power, no access logging — is stated in the
+preamble of [`results/benchmark_summary.md`](../results/benchmark_summary.md)
+and the environment in [`results/environment.md`](../results/environment.md).
 
 ## 10. Limitations
 
 TBD. Known now: CPU-only, single-process, local; no distributed
-infrastructure by design in v0.1.
+infrastructure by design in v0.1. Client disconnects while queued are not
+detected (§6.7).
