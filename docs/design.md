@@ -47,11 +47,38 @@ States and transitions:
   caller receives 504 and the computed result is discarded — deadline
   semantics are honored over sunk cost.
 
-## 3. Why the queue core lives in C++
+## 3. C++ bounded queue and Python boundary
 
-TBD (Day 1.5). Will cover: GIL constraints on true multi-producer
-concurrency, lock granularity, and the throughline from the
-`lob-latency-lab` matching engine.
+*(Implemented after Day 5 once the macOS toolchain blocker cleared.)*
+
+The first native primitive is `miniserve::BoundedQueue`, a bounded FIFO of
+opaque `uint64_t` request IDs. `try_push()` performs the capacity check and
+insertion under one mutex, so admission is linearizable: the caller either
+owns a queue slot or receives `false` immediately. `try_pop()` and
+`pop_batch(max_items)` remove in FIFO order under the same lock. Queue depth
+can therefore never exceed the constructor-provided capacity.
+
+**Why IDs instead of Python objects.** Python owns request payloads and
+`asyncio.Future` instances in a registry keyed by request ID. The C++ queue
+never stores `py::object`. Copying or destroying a Python object changes its
+reference count and requires the GIL; allowing those operations inside a
+producer/consumer queue would create unsafe lifetime edges and make the native
+core's concurrency claims misleading. Integer IDs keep ownership explicit and
+let the scheduler resolve futures on the Python event loop.
+
+**Why C++ at all.** The point is not that a mutex-protected deque is impossible
+in Python. The point is to isolate a small, testable admission primitive whose
+capacity invariant and FIFO behavior are independent of the event loop and
+whose operations can run with the GIL released. The pybind11 methods use
+`gil_scoped_release`, and the native test exercises multiple producers and
+consumers for loss, duplication, full drain, and bounded completion. This continues the
+`lob-latency-lab` pattern: keep the hot concurrent state transition small and
+native; keep orchestration and policy in Python.
+
+**Deliberate scope boundary.** The queue does not yet own deadlines, shutdown
+state, blocking waits, payloads, or futures. Those are scheduler policies and
+will be added only after the basic request registry and exactly-once resolution
+path exist.
 
 ## 4. Model runner and batch shape assembly
 
