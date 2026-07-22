@@ -4,74 +4,89 @@
 
 The model is incidental; the scheduler is the point.
 
-> **Status: v0.1 in progress — Day 2 (model runner) complete; C++ queue core (Day 1.5) deferred pending a macOS toolchain update.** Everything below marked *(planned)* does not exist yet. This README will only ever describe what has actually been built and measured.
+> **Status: v0.1 in progress — synchronous baseline and C++ bounded-queue milestone complete.** The async scheduler, dynamic batching, deadlines, shutdown, and metrics remain planned. This README distinguishes built behavior from planned behavior.
 
 ## Why this project exists
 
 Serving systems live or die on their concurrency core: how requests queue, how batches form, what happens when the queue is full, and what happens to in-flight work at shutdown. This repo builds that core deliberately — including intentionally inducing and fixing race conditions — rather than assembling framework defaults. It is the serving-side companion to [`lob-latency-lab`](https://github.com/ow3ntd/lob-latency-lab), which applied the same approach (C++ hot path, stress testing, benchmark methodology) to a limit order book.
 
-## Architecture *(planned)*
+## Architecture
 
-```
+```text
                         ┌────────────────────────────────────────┐
   HTTP requests ──────► │  FastAPI (Python)                      │
-                        │    └─ async scheduler (orchestration)  │
+                        │    └─ async scheduler (planned)        │
                         │         │            ▲                 │
                         │   ┌─────▼────────────┴─────┐           │
-                        │   │  C++ bounded queue /   │  pybind11 │
-                        │   │  batch-formation core  │  boundary │
+                        │   │ C++ bounded queue of   │  pybind11 │
+                        │   │ opaque request IDs     │  boundary │
                         │   └─────┬──────────────────┘           │
                         │         ▼                              │
                         │   model runner (batched inference)     │
                         └────────────────────────────────────────┘
 ```
 
-Diagram to be replaced with the real one once the boundary exists (Day 6–7).
+Python will own request payloads and per-request futures. The C++ queue stores only opaque integer IDs, avoiding Python-object lifetime and GIL hazards inside the concurrent core.
 
 ## Features
 
 - [x] Health endpoint (`GET /health`)
-- [ ] C++ bounded, thread-safe queue with pybind11 bindings *(Day 1.5)*
-- [x] Model runner abstraction with explicit batch assembly/splitting and a padding-leak invariance test *(Day 2)*
-- [ ] `POST /predict` *(Day 3)*
-- [ ] Async scheduler with dynamic batching (`max_batch_size`, `max_wait_ms`) *(Days 6–9)*
-- [ ] Deliberate concurrency bug hunt, documented in `docs/concurrency_bugs.md` *(Day 10)*
-- [ ] Backpressure (503 on full queue), request timeouts, graceful shutdown drain *(Days 11–12)*
-- [ ] Prometheus `/metrics` + structured tracing with correlation IDs *(Day 13)*
-- [ ] Reproducible load testing with recorded trace replay *(Day 14)*
+- [x] C++ bounded, thread-safe FIFO with immediate full-queue rejection
+- [x] FIFO batch pop and multi-producer/multi-consumer native stress test
+- [x] pybind11 boundary that releases the GIL around queue operations
+- [x] Model runner abstraction with explicit batch assembly/splitting and a padding-leak invariance test
+- [x] Synchronous `POST /predict` baseline
+- [x] Reproducible closed-loop baseline benchmark
+- [ ] Async scheduler with dynamic batching (`max_batch_size`, `max_wait_ms`)
+- [ ] Deliberate concurrency bug hunt, documented in `docs/concurrency_bugs.md`
+- [ ] Backpressure wiring (503), request timeouts, graceful bounded shutdown
+- [ ] Prometheus `/metrics` + structured tracing with correlation IDs
+- [ ] Open-loop overload tests and recorded trace replay
 
 ## Quickstart
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 
-# run the server
+# Configure and build the C++ core + pybind11 module.
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+
+# Run native and Python tests.
+ctest --test-dir build --output-on-failure
+PYTHONPATH="build/python:." pytest
+
+# Run the current synchronous baseline server.
 uvicorn app.main:app --reload
-
-# hit the health endpoint
-curl http://127.0.0.1:8000/health
 ```
 
-## Running tests
+Example queue use after building:
 
-```bash
-pytest
+```python
+from miniserve_core import BoundedQueue
+
+queue = BoundedQueue(2)
+assert queue.try_push(101)
+assert queue.try_push(102)
+assert not queue.try_push(103)  # explicit backpressure signal
+assert queue.pop_batch(2) == [101, 102]
 ```
 
 ## Benchmarks
 
-TBD — no numbers are published until they have been measured under the methodology in `results/` (5+ trials with mean/median/stddev, environment logged in `results/environment.md`, warm/cold separated, load shape stated). First baseline lands on Day 4.
+The current measured baseline is synchronous and unbatched. On the recorded Apple M4 environment, c=1 measured 1583.8 ± 59.2 req/s with 0.61 ms p50; c=8 measured 1712.2 ± 47.2 req/s with 3.09 ms p50 and 23.25 ms p99. Full methodology and caveats are in [`results/benchmark_summary.md`](results/benchmark_summary.md).
 
-## Key engineering lessons
-
-TBD — populated as the devlog (`docs/devlog.md`) and `docs/concurrency_bugs.md` accumulate real content.
+The C++ queue is not yet integrated into `/predict`, so these numbers are **not** queue or batching results.
 
 ## Limitations
 
-- CPU-only, single process, local machine. No GPU, no distributed serving, no Kubernetes/Redis/Ray — deliberately out of scope for v0.1.
+- CPU-only, single process, local machine. No GPU, distributed serving, Kubernetes, Redis, or Ray in v0.1.
+- The C++ queue currently stores request IDs only; Python scheduler integration is the next milestone.
+- No blocking queue operations, cancellation, deadlines, shutdown state, or metrics in the core yet.
 - Not production-ready and not claimed to be; this is a concurrency-first serving lab.
 
-## Roadmap
+## Next milestone
 
-See the daily progression in `docs/design.md` (once written). v0.2 candidates: GPU support, multiple model backends, priority scheduling.
+Add the Python async scheduler around the proven queue primitive: a request registry keyed by ID, exactly-once future resolution, one worker, and fixed-size batch execution before adding timers or shutdown behavior.
