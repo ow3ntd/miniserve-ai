@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: C++ and Python
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Configure release build
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build native core and Python extension
+        run: cmake --build build --parallel 2
+
+      - name: Run native tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Run Python tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}/build/python:${{ github.workspace }}
+        run: python -m pytest -q
+
+  sanitizers:
+    name: Address and Undefined Behavior Sanitizers
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Configure sanitizer build
+        run: |
+          cmake -S . -B build-sanitize \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DMINISERVE_BUILD_PYTHON=OFF \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build native tests
+        run: cmake --build build-sanitize --parallel 2
+
+      - name: Run sanitizer tests
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build-sanitize --output-on-failure
