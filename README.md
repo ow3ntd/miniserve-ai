@@ -1,5 +1,7 @@
 # miniserve-ai
 
+[![CI](https://github.com/ow3ntd/miniserve-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/ow3ntd/miniserve-ai/actions/workflows/ci.yml)
+
 **A concurrent request scheduler with a pluggable model backend** — a hand-built C++ bounded-queue core exposed to Python via pybind11, an async dynamic-batching scheduler on top of it, and failure handling (backpressure, timeouts, graceful drain) exercised under real load and measured with statistical rigor.
 
 The model is incidental; the scheduler is the point.
