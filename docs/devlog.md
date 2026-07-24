@@ -6,6 +6,45 @@ retroactive polish.
 
 ---
 
+## 2026-07-24 — Python request registry
+
+**Done**
+
+- Added `app/request_registry.py` with Python-owned pending request state.
+- Added monotonically increasing positive request IDs compatible with the
+  native queue's `uint64_t` contract.
+- Added immutable token ownership, event-loop futures, monotonic arrival
+  timestamps, and absolute monotonic deadlines.
+- Added exactly-once `resolve`, `fail`, and `cancel` lifecycle operations.
+- Added focused tests covering ID allocation, timeout validation, immutable
+  token copies, deadlines, success, failure, cancellation, duplicate
+  completion, ID exhaustion, unknown IDs, and a 5,000-request leak check.
+
+**Decisions**
+
+- **Python owns payloads and futures; C++ owns only request IDs.** This keeps
+  Python object lifetime and reference counting outside the concurrent native
+  queue.
+- **Event-loop-thread confinement instead of locks.** Registry state will be
+  mutated only by scheduler code running on one asyncio event loop.
+- **Remove before completing.** A request record is removed before its future
+  is resolved, failed, or cancelled so completion callbacks cannot re-enter
+  the registry and complete the same request again.
+- **Late completion is a safe no-op.** Lifecycle methods return `False` for
+  unknown or previously completed IDs rather than raising
+  `InvalidStateError`.
+- **Store deadlines now; enforce them later.** Registration records the full
+  end-to-end monotonic deadline, while scheduler timeout enforcement remains
+  outside this milestone.
+
+**Next**
+
+- Add the scheduler admission layer that registers a request, atomically
+  attempts to enqueue its ID in the bounded C++ queue, and rolls back the
+  registry entry immediately when the queue is full.
+
+---
+
 ## 2026-07-21 — C++ bounded queue + pybind11 boundary
 
 **Done**

@@ -80,6 +80,38 @@ state, blocking waits, payloads, or futures. Those are scheduler policies and
 will be added only after the basic request registry and exactly-once resolution
 path exist.
 
+### 3.1 Python request registry and ownership
+
+The native queue stores only opaque `uint64_t` request IDs. Python owns the
+state associated with each ID through `RequestRegistry`:
+
+- an immutable tuple of input token IDs
+- an `asyncio.Future` belonging to the active event loop
+- the monotonic arrival timestamp
+- the absolute monotonic deadline
+
+This boundary prevents the concurrent C++ core from owning Python objects or
+performing Python reference-count operations. The native layer is responsible
+only for bounded FIFO admission and batch formation; Python remains responsible
+for payload lifetime, future completion, cancellation, and error propagation.
+
+Registry mutation is confined to one asyncio event-loop thread. The registry is
+therefore intentionally not protected by locks and must not be mutated directly
+from worker threads.
+
+Each lifecycle operation removes the record before resolving, failing, or
+cancelling its future. This ordering makes completion re-entrant-safe: callbacks
+triggered by future completion cannot find and complete the same request again.
+
+`resolve()`, `fail()`, and `cancel()` return `True` only for the first valid
+completion. Repeated or late lifecycle events return `False` and become safe
+no-ops. This provides the exactly-once ownership contract required for future
+races among inference completion, deadlines, cancellation, and shutdown.
+
+Deadlines are recorded at registration using a monotonic clock. This milestone
+stores deadline metadata only; expiration enforcement is added later in the
+scheduler and batch-formation layers.
+
 ## 4. Model runner and batch shape assembly
 
 *(Written Day 2, when this was built.)*
