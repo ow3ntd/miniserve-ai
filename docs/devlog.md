@@ -6,6 +6,41 @@ retroactive polish.
 
 ---
 
+## 2026-07-24 — Day 3: scheduler admission transaction
+
+**Done**
+
+- Added `AdmissionController` to connect Python-owned request state to the
+  bounded native queue.
+- Added non-blocking admission through opaque request IDs.
+- Added immediate `QueueFullError` rejection when native capacity is reached.
+- Added rollback for queue rejection and native enqueue exceptions.
+- Added tests using controlled queues and the real pybind11 queue.
+- Verified FIFO admission order and that rejected requests leave no registry
+  entries or pending futures.
+
+**Decisions**
+
+- **Admission is a transaction.** A successful call leaves both a native
+  queued ID and a Python registry record; a failed call leaves neither.
+- **Rollback cancels the internal future.** The caller receives
+  `QueueFullError`; future cancellation is internal cleanup that prevents an
+  orphaned pending future.
+- **Rejected IDs are not reused.** Monotonic allocation makes request identity
+  unambiguous in future logs, metrics, and race investigations.
+- **HTTP behavior remains outside this module.** A later FastAPI integration
+  will translate `QueueFullError` into HTTP 503.
+- **No worker behavior yet.** Dequeueing, inference, timeout enforcement, and
+  result routing remain separate milestones.
+
+**Next**
+
+- Add one fixed-size scheduler worker that dequeues request IDs, retrieves
+  Python-owned payloads, performs one model batch, and routes each output to
+  the correct future.
+
+---
+
 ## 2026-07-24 — Python request registry
 
 **Done**

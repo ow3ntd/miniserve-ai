@@ -112,6 +112,37 @@ Deadlines are recorded at registration using a monotonic clock. This milestone
 stores deadline metadata only; expiration enforcement is added later in the
 scheduler and batch-formation layers.
 
+### 3.2 Admission transaction
+
+`AdmissionController` connects the Python-owned request registry to the
+bounded native queue. Admission is performed synchronously on the asyncio
+event-loop thread as a small transaction:
+
+1. Register the payload, future, arrival time, and deadline in Python.
+2. Call the native queue's non-blocking `try_push()` with the opaque ID.
+3. On success, retain both the registry record and queued request ID.
+4. On rejection or enqueue failure, remove the registry record and cancel
+   its internal future before propagating the admission error.
+
+The externally visible queue-full outcome is `QueueFullError`, which the API
+layer will later translate to HTTP 503. Cancelling the internal future during
+rollback is cleanup only: `admit()` does not return the rejected
+`PendingRequest`, so cancellation is not presented as the client-visible
+result.
+
+Rejected request IDs are not reused. ID allocation remains monotonic so logs,
+metrics, and future lifecycle investigations cannot confuse a later request
+with an earlier rejected one.
+
+The admission invariants are:
+
+- If `admit()` returns, the request ID is queued and its Python registry record
+  remains live.
+- If `admit()` raises, no registry record or unresolved internal future remains.
+- Queue admission never blocks.
+- Queue-full rejection does not disturb previously accepted requests.
+- FIFO ordering is preserved by the native queue.
+
 ## 4. Model runner and batch shape assembly
 
 *(Written Day 2, when this was built.)*
