@@ -6,6 +6,79 @@ retroactive polish.
 
 ---
 
+## 2026-08-08 — Day 5: asynchronous scheduler integration
+
+**Done**
+
+- Added `AsyncScheduler`, owning one background asyncio task awakened by an
+  `asyncio.Event` and draining immediately available fixed-size batches.
+- Integrated scheduler start/stop through FastAPI lifespan and replaced the
+  synchronous `/predict` handler with async admission plus per-request future
+  waiting.
+- Wired the native bounded queue into HTTP admission; `QueueFullError` now
+  produces HTTP 503.
+- Offloaded only blocking `ModelRunner.predict()` calls with
+  `asyncio.to_thread()`. Registry preparation and completion remain on the
+  event-loop thread.
+- Serialized model calls by awaiting each inference before preparing another
+  batch.
+- Added pre-admission `ModelRunner.validate_request()` so invalid model input
+  returns 422 without failing valid requests in a shared batch.
+- Added shielded future waiting and explicit registry cancellation when a
+  request coroutine is cancelled.
+- Made stop terminal and non-restartable. Pending registry entries are
+  cancelled; restart is forbidden because cancelling a `to_thread()` await
+  cannot stop its already-running inference thread.
+- Added regressions for concurrent result routing, event-loop responsiveness,
+  non-overlapping model calls, queue saturation, model failures, cancellation,
+  stop during inference, validation isolation, and the drain-to-wait lost-
+  wake-up boundary.
+- Final Python suite: **86 passed**. Changed-file compilation and
+  `git diff --check` also passed.
+
+**Deliberate limitations**
+
+- No graceful drain. A running inference thread may finish after stop, and
+  queued native IDs are not drained.
+- Dynamic `max_wait_ms` batch formation, deadline enforcement, metrics, and
+  scheduler benchmarks remain future work.
+- Existing measured results remain the older synchronous baseline; no Day 5
+  performance numbers were invented.
+
+**Next**
+
+- Add dynamic batch formation using `max_wait_ms` and measure it separately
+  from the synchronous baseline.
+
+---
+
+## 2026-07-25 — Day 4: fixed-size batch worker
+
+**Done**
+
+- Added `FixedBatchWorker.process_once()` to pop up to `max_batch_size` opaque
+  IDs, recover Python payloads, execute one model batch, and route FIFO outputs
+  to their matching futures.
+- Added stale-ID skipping, output-cardinality validation, whole-batch model
+  failure propagation, and exactly-once handling of late completion.
+- Added integration coverage across `AdmissionController`, the native queue,
+  `RequestRegistry`, and the real `ModelRunner`.
+
+**Decisions**
+
+- This milestone was synchronous and one-shot. It did not include a background
+  task or FastAPI integration.
+- Empty and all-stale batches do not invoke the model. A genuine model error or
+  wrong output count fails every live request in that batch.
+- FIFO input/output correspondence is the routing contract.
+
+**Next**
+
+- Add the asynchronous scheduler loop and connect it to `/predict` while
+  keeping registry access on the event-loop thread.
+
+---
+
 ## 2026-07-24 — Day 3: scheduler admission transaction
 
 **Done**

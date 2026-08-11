@@ -7,6 +7,10 @@ to the client identically as 422s -- that boundary is what these tests
 pin down.
 """
 
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -104,6 +108,34 @@ def test_predict_out_of_range_token_is_422():
     assert "out of range" in resp.json()["detail"]
 
 
+def test_invalid_request_does_not_fail_concurrent_valid_request():
+    runner = ModelRunner()
+    runner.load()
+    expected = runner.predict([VALID_TOKENS])[0]
+    application = create_app(runner, max_batch_size=2)
+    invalid_tokens = [runner.config.vocab_size]
+
+    with TestClient(application) as client, ThreadPoolExecutor(2) as pool:
+        invalid = pool.submit(
+            client.post,
+            "/predict",
+            json={"tokens": invalid_tokens},
+        )
+        valid = pool.submit(
+            client.post,
+            "/predict",
+            json={"tokens": VALID_TOKENS},
+        )
+
+        invalid_response = invalid.result(timeout=2.0)
+        valid_response = valid.result(timeout=2.0)
+
+    assert invalid_response.status_code == 422
+    assert "out of range" in invalid_response.json()["detail"]
+    assert valid_response.status_code == 200
+    assert valid_response.json()["outputs"] == pytest.approx(expected)
+
+
 # --------------------------------------------------------------------- #
 # Server-side readiness and method handling                              #
 # --------------------------------------------------------------------- #
@@ -120,3 +152,40 @@ def test_predict_with_unloaded_runner_is_503():
 def test_get_predict_is_405():
     resp = make_client().get("/predict")
     assert resp.status_code == 405
+
+
+def test_queue_saturation_returns_503():
+    entered_model = threading.Event()
+    release_model = threading.Event()
+
+    class BlockingRunner(ModelRunner):
+        def predict(self, batch):
+            entered_model.set()
+            assert release_model.wait(timeout=2.0)
+            return [[float(tokens[0])] * self.config.n_outputs for tokens in batch]
+
+    runner = BlockingRunner()
+    runner.load()
+    application = create_app(
+        runner,
+        queue_capacity=1,
+        max_batch_size=1,
+    )
+
+    with TestClient(application) as client, ThreadPoolExecutor(2) as pool:
+        first = pool.submit(client.post, "/predict", json={"tokens": [1]})
+        assert entered_model.wait(timeout=2.0)
+
+        second = pool.submit(client.post, "/predict", json={"tokens": [2]})
+        deadline = time.monotonic() + 2.0
+        while not application.state.scheduler._queue.full:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+
+        saturated = client.post("/predict", json={"tokens": [3]})
+        assert saturated.status_code == 503
+        assert saturated.json()["detail"] == "request queue is full"
+
+        release_model.set()
+        assert first.result(timeout=2.0).status_code == 200
+        assert second.result(timeout=2.0).status_code == 200

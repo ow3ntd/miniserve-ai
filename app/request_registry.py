@@ -122,5 +122,11 @@ class RequestRegistry(Generic[ResultT]):
         request.future.cancel()
         return True
 
+    def cancel_all(self) -> int:
+        """Cancel and remove every pending request."""
+
+        request_ids = tuple(self._requests)
+        return sum(self.cancel(request_id) for request_id in request_ids)
+
     def __len__(self) -> int:
         return len(self._requests)

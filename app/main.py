@@ -1,17 +1,13 @@
-"""miniserve-ai -- a concurrent request scheduler with a pluggable model backend.
-
-Day 3 scope: application factory, health endpoint, and a synchronous
-/predict endpoint wired directly to the ModelRunner. Every request is a
-batch of one, executed inline -- no queueing or batching exists yet.
-This is deliberately the "before" picture the Day 4 baseline benchmark
-will measure.
-"""
+"""miniserve-ai FastAPI application."""
 
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 
+from app.admission import QueueFullError
 from app.model_runner import ModelRunner
+from app.scheduler import AsyncScheduler
 from app.schemas import PredictRequest, PredictResponse
 
 APP_NAME = "miniserve-ai"
@@ -21,31 +17,49 @@ VERSION = "0.1.0.dev0"
 _STARTED_AT = time.monotonic()
 
 
-def create_app(runner: ModelRunner | None = None) -> FastAPI:
+def create_app(
+    runner: ModelRunner | None = None,
+    *,
+    queue_capacity: int = 128,
+    max_batch_size: int = 8,
+) -> FastAPI:
     """Application factory.
 
     Accepts an optional pre-built ModelRunner so tests can inject a
     custom-configured (or deliberately unloaded) runner. By default,
     builds one and loads it eagerly.
 
-    Eager load in the factory -- rather than a FastAPI lifespan hook --
-    keeps the factory self-contained and lets tests use TestClient
-    without a context manager. When the scheduler lands (Day 6) and real
-    startup/shutdown ordering matters, this moves to a lifespan context;
-    that tradeoff is recorded in the devlog.
+    The model remains eagerly loaded for compatibility. The scheduler task is
+    started and stopped by FastAPI lifespan.
     """
     if runner is None:
         runner = ModelRunner()
         runner.load()
+
+    scheduler = AsyncScheduler[list[float]](
+        runner,
+        queue_capacity=queue_capacity,
+        max_batch_size=max_batch_size,
+    )
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        await scheduler.start()
+        try:
+            yield
+        finally:
+            await scheduler.stop()
 
     app = FastAPI(
         title=APP_NAME,
         version=VERSION,
         description=(
             "A concurrent request scheduler with a pluggable model backend. "
-            "C++ bounded-queue core (planned), async dynamic batching (planned)."
+            "C++ bounded-queue core with asynchronous fixed batching."
         ),
+        lifespan=lifespan,
     )
+    app.state.scheduler = scheduler
 
     @app.get("/health")
     async def health() -> dict:
@@ -58,24 +72,34 @@ def create_app(runner: ModelRunner | None = None) -> FastAPI:
         }
 
     @app.post("/predict", response_model=PredictResponse)
-    def predict(request: PredictRequest) -> PredictResponse:
-        """Synchronous single-request prediction (a batch of one).
-
-        Declared `def`, not `async def`, on purpose: FastAPI runs sync
-        handlers in its threadpool, so a slow model call doesn't stall
-        the event loop -- and the endpoint makes no async promises it
-        can't keep. The scheduler replaces this path entirely later.
-        """
+    async def predict(request: PredictRequest) -> PredictResponse:
+        """Admit one request and await only its corresponding result."""
         if not runner.is_loaded:
             # Server-side readiness problem, not a client error.
             raise HTTPException(status_code=503, detail="model not loaded")
         try:
-            outputs = runner.predict([request.tokens])
+            runner.validate_request(request.tokens)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        # FastAPI lifespan is the production lifecycle. Starting idempotently
+        # here also supports lightweight TestClient usage without a context
+        # manager, where Starlette does not enter lifespan.
+        await scheduler.start()
+        try:
+            pending = scheduler.admit(request.tokens)
+        except QueueFullError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="request queue is full",
+            ) from exc
+
+        try:
+            outputs = await scheduler.wait(pending)
         except ValueError as exc:
             # Model-dependent validation the schema can't know about
             # (e.g. token ids outside the model's vocab size).
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return PredictResponse(outputs=outputs[0])
+        return PredictResponse(outputs=outputs)
 
     return app
 
