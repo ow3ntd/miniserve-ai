@@ -114,6 +114,11 @@ class ModelRunner:
             out = self._model(tokens, mask)         # [B, n_outputs]
         return self._disassemble(out)
 
+    def validate_request(self, tokens: Sequence[int]) -> None:
+        """Validate one request using the model's existing input rules."""
+
+        self._validate([tokens])
+
     # ---------------------------------------------------------------- #
     # Batch shape work: the actual ML-systems content of this module.  #
     # ---------------------------------------------------------------- #

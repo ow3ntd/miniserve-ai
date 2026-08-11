@@ -55,6 +55,21 @@ class BatchOutcome:
     failed: int
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedBatch(Generic[ResultT]):
+    """Loop-thread-owned state for one dequeued model batch."""
+
+    dequeued: int
+    stale: int
+    requests: tuple[PendingRequest[ResultT], ...]
+
+    @property
+    def inputs(self) -> tuple[tuple[int, ...], ...]:
+        """Return immutable model inputs safe to pass to another thread."""
+
+        return tuple(request.tokens for request in self.requests)
+
+
 class FixedBatchWorker(Generic[ResultT]):
     """Executes at most one fixed-size model batch per call."""
 
@@ -95,6 +110,26 @@ class FixedBatchWorker(Generic[ResultT]):
         the future background worker loop.
         """
 
+        prepared = self.prepare_batch()
+
+        if not prepared.requests:
+            return BatchOutcome(
+                dequeued=prepared.dequeued,
+                stale=prepared.stale,
+                completed=0,
+                failed=0,
+            )
+
+        try:
+            outputs = self.predict(prepared.inputs)
+        except Exception as error:
+            return self.fail_batch(prepared, error)
+
+        return self.complete_batch(prepared, outputs)
+
+    def prepare_batch(self) -> PreparedBatch[ResultT]:
+        """Dequeue IDs and recover live requests on the calling thread."""
+
         request_ids = self._queue.pop_batch(self._max_batch_size)
 
         if len(request_ids) > self._max_batch_size:
@@ -103,11 +138,10 @@ class FixedBatchWorker(Generic[ResultT]):
             )
 
         if not request_ids:
-            return BatchOutcome(
+            return PreparedBatch(
                 dequeued=0,
                 stale=0,
-                completed=0,
-                failed=0,
+                requests=(),
             )
 
         live_requests: list[PendingRequest[ResultT]] = []
@@ -122,50 +156,75 @@ class FixedBatchWorker(Generic[ResultT]):
 
             live_requests.append(request)
 
-        if not live_requests:
-            return BatchOutcome(
-                dequeued=len(request_ids),
-                stale=stale_count,
-                completed=0,
-                failed=0,
+        return PreparedBatch(
+            dequeued=len(request_ids),
+            stale=stale_count,
+            requests=tuple(live_requests),
+        )
+
+    def predict(
+        self,
+        batch: Sequence[Sequence[int]],
+        /,
+    ) -> list[ResultT]:
+        """Run the blocking model call without touching registry state."""
+
+        outputs = list(self._model.predict(batch))
+
+        if len(outputs) != len(batch):
+            raise BatchResultCountError(
+                "model returned "
+                f"{len(outputs)} outputs for "
+                f"{len(batch)} requests"
             )
 
-        batch = [request.tokens for request in live_requests]
+        return outputs
 
-        try:
-            outputs = list(self._model.predict(batch))
+    def complete_batch(
+        self,
+        prepared: PreparedBatch[ResultT],
+        outputs: Sequence[ResultT],
+    ) -> BatchOutcome:
+        """Resolve a prepared batch on the registry's event-loop thread."""
 
-            if len(outputs) != len(live_requests):
-                raise BatchResultCountError(
-                    "model returned "
-                    f"{len(outputs)} outputs for "
-                    f"{len(live_requests)} requests"
-                )
-        except Exception as error:
-            failed_count = sum(
-                self._registry.fail(request.request_id, error)
-                for request in live_requests
-            )
-
-            return BatchOutcome(
-                dequeued=len(request_ids),
-                stale=stale_count,
-                completed=0,
-                failed=failed_count,
+        if len(outputs) != len(prepared.requests):
+            raise BatchResultCountError(
+                "completion received "
+                f"{len(outputs)} outputs for "
+                f"{len(prepared.requests)} requests"
             )
 
         completed_count = sum(
             self._registry.resolve(request.request_id, output)
             for request, output in zip(
-                live_requests,
+                prepared.requests,
                 outputs,
                 strict=True,
             )
         )
 
         return BatchOutcome(
-            dequeued=len(request_ids),
-            stale=stale_count,
+            dequeued=prepared.dequeued,
+            stale=prepared.stale,
             completed=completed_count,
             failed=0,
+        )
+
+    def fail_batch(
+        self,
+        prepared: PreparedBatch[ResultT],
+        error: BaseException,
+    ) -> BatchOutcome:
+        """Fail every still-live request in a prepared batch exactly once."""
+
+        failed_count = sum(
+            self._registry.fail(request.request_id, error)
+            for request in prepared.requests
+        )
+
+        return BatchOutcome(
+            dequeued=prepared.dequeued,
+            stale=prepared.stale,
+            completed=0,
+            failed=failed_count,
         )
