@@ -22,6 +22,7 @@ def create_app(
     *,
     queue_capacity: int = 128,
     max_batch_size: int = 8,
+    max_wait_ms: float = 0,
 ) -> FastAPI:
     """Application factory.
 
@@ -40,6 +41,7 @@ def create_app(
         runner,
         queue_capacity=queue_capacity,
         max_batch_size=max_batch_size,
+        max_wait_ms=max_wait_ms,
     )
 
     @asynccontextmanager
@@ -55,7 +57,7 @@ def create_app(
         version=VERSION,
         description=(
             "A concurrent request scheduler with a pluggable model backend. "
-            "C++ bounded-queue core with asynchronous fixed batching."
+            "C++ bounded-queue core with asynchronous dynamic batching."
         ),
         lifespan=lifespan,
     )

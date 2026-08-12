@@ -1,6 +1,6 @@
 # miniserve-ai — Design
 
-This document describes the implemented Day 5 system. Planned policies are
+This document describes the implemented Day 6 system. Planned policies are
 marked explicitly.
 
 ## 1. Overview
@@ -16,7 +16,7 @@ The current request path is:
         -> AdmissionController
         -> RequestRegistry + C++ BoundedQueue
         -> AsyncScheduler
-        -> fixed-size batch preparation
+        -> dynamic batch formation and size-or-time dispatch
         -> ModelRunner.predict() in a worker thread
         -> event-loop-thread future completion
         -> HTTP response
@@ -100,7 +100,8 @@ endpoint.
 `FixedBatchWorker` separates one iteration into phases shared by its original
 synchronous `process_once()` API and the asynchronous scheduler:
 
-1. **Prepare.** `prepare_batch()` pops up to `max_batch_size` FIFO IDs,
+1. **Prepare.** `prepare_batch(max_items)` pops only the remaining number of
+   FIFO IDs a forming batch can accept (defaulting to `max_batch_size`),
    retrieves live requests, and returns a `PreparedBatch`. Unknown IDs are
    stale and safely skipped; an empty or all-stale batch does not invoke the
    model.
@@ -116,16 +117,34 @@ thread. Only the registry-free immutable inputs and model result cross the
 `asyncio.to_thread()` boundary. FIFO correspondence plus registry removal on
 completion preserves exactly-once routing.
 
-Current batching is **fixed-size and immediate**. After waking, the scheduler
-repeatedly processes up to `max_batch_size` requests already available; it does
-not delay a partial batch to collect more work.
+The optional `max_items` bound is the only Day 6 worker extension. The original
+zero-argument preparation and synchronous `process_once()` behavior are
+preserved.
 
-### 5.1 Planned dynamic batching
+### 5.1 Dynamic batch formation
 
-Dynamic formation using `max_wait_ms` is planned, not implemented. The intended
-policy is to dispatch when either `max_batch_size` is reached or the wait
-window opened by the first request expires. Its latency/throughput tradeoff and
-timer/producer races require separate implementation and measurement.
+Two configuration values govern the implemented forming-batch lifecycle:
+
+- `max_batch_size` is the maximum number of **live** requests in a batch.
+- `max_wait_ms` is the maximum batching delay measured from the first live
+  request entering an empty forming batch. It is finite and non-negative;
+  zero preserves Day 5 immediate dispatch.
+
+The scheduler uses the asyncio event loop's monotonic clock. Recovering the
+first live request establishes one absolute batch deadline. Later live
+arrivals may fill remaining capacity, but the stored deadline is never
+recomputed, so they cannot extend the window. The batch dispatches immediately
+when it becomes full or as a partial batch when the remaining time reaches
+zero, whichever happens first.
+
+Stale and cancelled IDs are removed from the native queue but do not count
+toward live capacity. The worker continues popping within the remaining
+capacity so live requests behind stale IDs can join the same forming batch.
+An empty or all-stale batch never invokes the model. Live requests preserve
+native FIFO order, and model output row *i* completes live request *i*.
+
+`max_wait_ms` is a batching latency policy, not a client timeout. The separate
+request deadline stored in `RequestRegistry` remains unenforced.
 
 ## 6. Asynchronous scheduler
 
@@ -133,11 +152,17 @@ timer/producer races require separate implementation and measurement.
 an `asyncio.Event`; the task waits on that event when idle rather than polling
 the queue, so an empty queue consumes no busy-spin CPU.
 
-The task clears the event before draining all immediately available batches.
-Admission during the drain sets it again, so after the queue becomes empty the
-next wait observes the set event. Admission after the task begins waiting wakes
-it normally. This ordering prevents a request from being stranded around the
-drain-to-wait transition.
+The task clears the event before consuming signaled work. When a partial batch
+is forming, it waits on that same event with the absolute batch deadline as its
+timeout—there is no polling loop or short sleep. Admission sets the event and
+lets the former inspect new FIFO IDs without changing the deadline.
+
+If admission races timeout expiration, either the timed wait observes the
+event or the timeout dispatches the current partial batch. After every dispatch
+the scheduler checks the queue again before returning to idle waiting, and a
+concurrently set event remains available to the next wait. The same ordering
+protects the empty-queue drain-to-wait transition, preventing lost wake-ups
+without busy-spinning.
 
 The single scheduler task awaits each `asyncio.to_thread()` model call before
 preparing another batch. Consequently it launches at most one model invocation
@@ -198,16 +223,17 @@ start, environment logging, AC power, and no access logging. Methodology is in
 [`results/benchmark_summary.md`](../results/benchmark_summary.md) and the
 environment in [`results/environment.md`](../results/environment.md).
 
-Those measurements cover the older synchronous, unbatched baseline. No Day 5
+Those measurements cover the older synchronous, unbatched baseline. No Day 6
 scheduler benchmark has been recorded.
 
 ## 10. Limitations
 
 - CPU-only and single-process.
-- Dynamic `max_wait_ms` batch formation is not implemented.
 - Deadlines are stored but not enforced.
+- HTTP 504 timeout behavior is not implemented.
 - Shutdown is terminal cancellation rather than graceful drain.
 - A running inference thread may finish after stop.
 - Queued native IDs are not drained during shutdown.
-- Metrics and scheduler benchmarks remain planned.
+- Metrics, tracing, and scheduler/open-loop benchmarks remain planned.
+- Multiple scheduler workers and GPU serving are not implemented.
 - Existing measured results cover the older synchronous baseline.

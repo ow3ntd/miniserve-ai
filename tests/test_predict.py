@@ -189,3 +189,41 @@ def test_queue_saturation_returns_503():
         release_model.set()
         assert first.result(timeout=2.0).status_code == 200
         assert second.result(timeout=2.0).status_code == 200
+
+
+def test_concurrent_predict_requests_share_one_dynamic_batch():
+    class RecordingRunner(ModelRunner):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+            self._lock = threading.Lock()
+
+        def predict(self, batch):
+            copied = [tuple(tokens) for tokens in batch]
+            with self._lock:
+                self.calls.append(copied)
+            return [
+                [float(tokens[0])] * self.config.n_outputs
+                for tokens in copied
+            ]
+
+    runner = RecordingRunner()
+    runner.load()
+    application = create_app(
+        runner,
+        max_batch_size=2,
+        max_wait_ms=200,
+    )
+
+    with TestClient(application) as client, ThreadPoolExecutor(2) as pool:
+        first = pool.submit(client.post, "/predict", json={"tokens": [11]})
+        second = pool.submit(client.post, "/predict", json={"tokens": [22]})
+        first_response = first.result(timeout=2.0)
+        second_response = second.result(timeout=2.0)
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert first_response.json()["outputs"] == [11.0] * runner.config.n_outputs
+    assert second_response.json()["outputs"] == [22.0] * runner.config.n_outputs
+    assert len(runner.calls) == 1
+    assert sorted(runner.calls[0]) == [(11,), (22,)]
