@@ -1,6 +1,6 @@
 # miniserve-ai — Design
 
-This document describes the implemented Day 6 system. Planned policies are
+This document describes the implemented Day 7 system. Planned policies are
 marked explicitly.
 
 ## 1. Overview
@@ -14,11 +14,11 @@ The current request path is:
     POST /predict
         -> structural and model-specific validation
         -> AdmissionController
-        -> RequestRegistry + C++ BoundedQueue
+        -> absolute deadline in RequestRegistry + C++ BoundedQueue ID
         -> AsyncScheduler
         -> dynamic batch formation and size-or-time dispatch
         -> ModelRunner.predict() in a worker thread
-        -> event-loop-thread future completion
+        -> per-request deadline supervision and future completion
         -> HTTP response
 
 ## 2. Request ownership and lifecycle
@@ -35,13 +35,25 @@ exactly-once completion without registry locks.
 Current transitions are:
 
     arrival -> VALIDATED -> ADMITTED -> QUEUED -> EXECUTING -> COMPLETED 200
-                    |           |
+                    |           |          |             |
+                    |           |          +-------------+-- EXPIRED 504
                     |           +-- queue full -> REJECTED 503
                     +-- invalid input -> REJECTED 422
 
-Caller cancellation removes and cancels the registry-owned future. Terminal
-scheduler stop cancels all pending registry entries. Deadlines are recorded on
-the monotonic clock but are not enforced; there is no HTTP 504 path yet.
+`RequestDeadlineExceeded` is the domain exception for an admitted request that
+exceeds its end-to-end deadline. Caller cancellation remains a separate
+lifecycle outcome. Terminal scheduler stop cancels all pending entries.
+
+`PendingRequest.deadline` is created once during registration as arrival plus
+`request_timeout_s`; it remains authoritative across queueing, batch formation,
+and inference. `RequestRegistry` exposes the same monotonic clock used to create
+and compare deadlines. Durations passed to asyncio waits are derived from that
+absolute clock domain rather than starting a fresh phase-local timeout.
+
+The result/deadline/cancellation race is remove-first: the first successful
+registry lifecycle operation owns completion. Result first means 200; deadline
+first means `RequestDeadlineExceeded` and HTTP 504; caller cancellation first
+means cancellation. Subsequent attempts return `False` and are safe no-ops.
 
 ## 3. C++ bounded queue and Python boundary
 
@@ -143,8 +155,18 @@ capacity so live requests behind stale IDs can join the same forming batch.
 An empty or all-stale batch never invokes the model. Live requests preserve
 native FIFO order, and model output row *i* completes live request *i*.
 
-`max_wait_ms` is a batching latency policy, not a client timeout. The separate
-request deadline stored in `RequestRegistry` remains unenforced.
+`max_wait_ms` is a batching latency policy, not a client timeout.
+`request_timeout_s` is the end-to-end client deadline beginning at registry
+admission.
+
+A forming batch waits until the earlier of its fixed first-live-request
+`max_wait_ms` deadline and the earliest live request deadline. Expiring a
+request does not reset or redefine the batching window. The registry removes
+the request exactly once and completes its future with
+`RequestDeadlineExceeded`; its opaque ID may remain in the native queue until
+dequeued as stale. Stale IDs do not consume capacity, all-stale batches never
+invoke the model, and unrelated live requests continue normally. Deadlines are
+rechecked immediately before dispatch.
 
 ## 6. Asynchronous scheduler
 
@@ -164,9 +186,17 @@ concurrently set event remains available to the next wait. The same ordering
 protects the empty-queue drain-to-wait transition, preventing lost wake-ups
 without busy-spinning.
 
-The single scheduler task awaits each `asyncio.to_thread()` model call before
-preparing another batch. Consequently it launches at most one model invocation
-at a time, while slow inference does not block the event loop.
+The single scheduler task launches each model call through
+`asyncio.to_thread()` and keeps model invocations serialized. While inference
+runs, one supervision loop watches all registry-owned deadlines, including
+requests queued behind the active invocation. Expired requests can therefore
+receive 504 before inference finishes. Python does not attempt to terminate
+the underlying executor thread.
+
+Output correspondence remains positional: model row *i* always belongs to
+original dispatched request *i*. Completion does not filter or shift output
+rows. If request *i* timed out or was cancelled while inference ran, resolving
+that ID is a safe no-op; other rows still reach their original requests.
 
 ### 6.1 Backpressure
 
@@ -183,17 +213,27 @@ back. On caller cancellation, the scheduler explicitly removes and cancels
 the request through `RequestRegistry`. Its queued native ID later appears as a
 stale ID and is skipped without an `InvalidStateError`.
 
+The wait uses the request's remaining absolute deadline. Because
+`RequestDeadlineExceeded` derives from `TimeoutError` and
+`asyncio.TimeoutError` aliases that built-in type, a caught wait timeout is
+disambiguated by inspecting the owned future: an already-completed future
+propagates its domain exception or winning result directly; only a still-
+pending future triggers deadline expiration. No per-request background timeout
+task or phase-local deadline is created.
+
 ### 6.3 Terminal stop
 
 Stop is terminal cancellation, not graceful drain. `stop()` cancels the
 background task and all pending registry entries, and the scheduler instance
 cannot restart.
 
-This rule is required because cancelling an asyncio task awaiting
-`asyncio.to_thread()` does not terminate the underlying inference thread. An
-already-running model call may therefore finish after scheduler stop. By
-forbidding restart, the same scheduler cannot launch a new inference that
-overlaps that old call. Queued native IDs are not drained.
+This rule is required because cancelling the asyncio wrapper around
+`asyncio.to_thread()` does not terminate the underlying inference thread. The
+scheduler explicitly cancels and awaits/consumes that wrapper so a later model
+exception cannot leak as an un-retrieved asyncio task exception. The executor
+thread may still finish after stop. By forbidding restart, the same scheduler
+cannot launch a new inference overlapping that old call. Queued IDs are not
+gracefully drained.
 
 A graceful policy that handles in-flight and queued work is explicitly
 deferred.
@@ -206,9 +246,10 @@ deferred.
 | 422 | invalid schema or model-specific input | Pydantic / endpoint |
 | 503 `request queue is full` | bounded-queue backpressure | admission / endpoint |
 | 503 `model not loaded` | readiness failure | endpoint |
+| 504 | admitted request exceeded its absolute deadline | scheduler / endpoint |
 | 500 | unexpected model/inference failure | scheduler → future |
 
-Deadline 504 and graceful-shutdown-specific responses are planned.
+Graceful-shutdown-specific responses are planned.
 
 ## 8. Metrics and tracing
 
@@ -223,14 +264,12 @@ start, environment logging, AC power, and no access logging. Methodology is in
 [`results/benchmark_summary.md`](../results/benchmark_summary.md) and the
 environment in [`results/environment.md`](../results/environment.md).
 
-Those measurements cover the older synchronous, unbatched baseline. No Day 6
+Those measurements cover the older synchronous, unbatched baseline. No Day 7
 scheduler benchmark has been recorded.
 
 ## 10. Limitations
 
 - CPU-only and single-process.
-- Deadlines are stored but not enforced.
-- HTTP 504 timeout behavior is not implemented.
 - Shutdown is terminal cancellation rather than graceful drain.
 - A running inference thread may finish after stop.
 - Queued native IDs are not drained during shutdown.
