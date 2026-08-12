@@ -6,6 +6,66 @@ retroactive polish.
 
 ---
 
+## 2026-08-11 — Day 6: dynamic batch formation
+
+**Done**
+
+- Added configurable, validated `max_wait_ms`; zero preserves immediate Day 5
+  dispatch.
+- Forming batches now dispatch on `max_batch_size` live requests or elapsed
+  `max_wait_ms`, whichever happens first.
+- Used the asyncio event loop's monotonic clock and fixed the batch deadline
+  when the first live request enters an empty forming batch.
+- Allowed later requests to join available capacity without resetting or
+  extending the original deadline.
+- Made stale and cancelled IDs consume no live capacity; formation continues
+  through them to find later live FIFO work, and all-stale batches skip the
+  model.
+- Extended `FixedBatchWorker.prepare_batch(max_items)` so the scheduler can
+  dequeue only a forming batch's remaining capacity while preserving
+  `process_once()` and zero-argument preparation behavior.
+- Kept event-driven wake-up during partial timed waits, with no polling or
+  production sleeps.
+- Added a real HTTP concurrency test proving two `/predict` calls can coalesce
+  into one model invocation.
+- Added timeout-boundary lost-wakeup coverage and preserved serialized model
+  execution.
+- Final Python suite: **105 passed**. Changed-file compilation and
+  `git diff --check` also passed.
+
+**Decisions**
+
+- **The first live request owns the window.** A fixed absolute deadline gives
+  a hard batching-latency bound; resetting it on later arrivals could postpone
+  dispatch indefinitely under steady traffic.
+- **Live capacity, not dequeued-ID count, determines fullness.** Cancelled IDs
+  are implementation debris, not work, so they cannot force undersized model
+  calls or block live requests behind them.
+- **One event serves idle and timed waiting.** Waiting on `asyncio.Event` with
+  the deadline's remaining time avoids polling and preserves admissions that
+  race timeout dispatch.
+- **One scheduler task still owns inference sequencing.** It awaits each
+  `asyncio.to_thread()` invocation before forming the next executing batch, so
+  model calls cannot overlap.
+- **Batch wait and request timeout remain separate.** `max_wait_ms` controls
+  formation latency only; stored request deadlines are not yet enforced.
+
+**Deferred**
+
+- Request deadline enforcement and HTTP 504.
+- Graceful drain.
+- Metrics and tracing.
+- Scheduler/open-loop benchmarks.
+- Multiple workers and GPU serving.
+
+No benchmark results or production-readiness claims were added.
+
+**Next**
+
+- Implement request deadline enforcement and HTTP 504 timeout behavior.
+
+---
+
 ## 2026-08-08 — Day 5: asynchronous scheduler integration
 
 **Done**

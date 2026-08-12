@@ -6,9 +6,9 @@ The worker connects three existing components:
 2. Recover Python-owned payloads from RequestRegistry.
 3. Execute one model batch and route each output to its matching future.
 
-This milestone deliberately implements one synchronous `process_once()` call.
-A continuous background loop, dynamic wait window, deadlines, and shutdown
-behavior are separate milestones.
+`process_once()` remains the synchronous one-shot API. The asynchronous
+scheduler also reuses the preparation and completion phases while owning its
+dynamic wait window; deadlines remain a separate milestone.
 """
 
 from __future__ import annotations
@@ -127,12 +127,28 @@ class FixedBatchWorker(Generic[ResultT]):
 
         return self.complete_batch(prepared, outputs)
 
-    def prepare_batch(self) -> PreparedBatch[ResultT]:
-        """Dequeue IDs and recover live requests on the calling thread."""
+    def prepare_batch(
+        self,
+        max_items: int | None = None,
+    ) -> PreparedBatch[ResultT]:
+        """Dequeue up to max_items IDs and recover their live requests."""
 
-        request_ids = self._queue.pop_batch(self._max_batch_size)
+        if max_items is None:
+            max_items = self._max_batch_size
+        if (
+            not isinstance(max_items, int)
+            or isinstance(max_items, bool)
+            or max_items <= 0
+            or max_items > self._max_batch_size
+        ):
+            raise ValueError(
+                "max_items must be a positive integer no greater than "
+                "max_batch_size"
+            )
 
-        if len(request_ids) > self._max_batch_size:
+        request_ids = self._queue.pop_batch(max_items)
+
+        if len(request_ids) > max_items:
             raise RuntimeError(
                 "queue returned more request IDs than requested"
             )

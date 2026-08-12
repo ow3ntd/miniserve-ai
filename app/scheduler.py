@@ -1,15 +1,17 @@
-"""Asynchronous fixed-batch inference scheduler."""
+"""Asynchronous dynamic-batch inference scheduler."""
 
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Sequence
+from numbers import Real
 from typing import Generic, TypeVar
 
 import miniserve_core
 
 from app.admission import AdmissionController
-from app.batch_worker import BatchModel, FixedBatchWorker
+from app.batch_worker import BatchModel, FixedBatchWorker, PreparedBatch
 from app.request_registry import PendingRequest, RequestRegistry
 
 
@@ -17,7 +19,7 @@ ResultT = TypeVar("ResultT")
 
 
 class AsyncScheduler(Generic[ResultT]):
-    """Own one task that serially executes fixed-size model batches."""
+    """Own one task that serially executes dynamically formed batches."""
 
     def __init__(
         self,
@@ -25,10 +27,20 @@ class AsyncScheduler(Generic[ResultT]):
         *,
         queue_capacity: int = 128,
         max_batch_size: int = 8,
+        max_wait_ms: float = 0,
         request_timeout_s: float = 30.0,
     ) -> None:
         if request_timeout_s <= 0:
             raise ValueError("request_timeout_s must be greater than zero")
+        if (
+            not isinstance(max_wait_ms, Real)
+            or isinstance(max_wait_ms, bool)
+            or not math.isfinite(max_wait_ms)
+            or max_wait_ms < 0
+        ):
+            raise ValueError(
+                "max_wait_ms must be a finite non-negative number"
+            )
 
         self._queue = miniserve_core.BoundedQueue(queue_capacity)
         self._registry = RequestRegistry[ResultT]()
@@ -43,6 +55,7 @@ class AsyncScheduler(Generic[ResultT]):
             max_batch_size=max_batch_size,
         )
         self._request_timeout_s = request_timeout_s
+        self._max_wait_s = float(max_wait_ms) / 1_000.0
         self._wake_event: asyncio.Event | None = None
         self._task: asyncio.Task[None] | None = None
         self._stopped = False
@@ -132,11 +145,9 @@ class AsyncScheduler(Generic[ResultT]):
             wake_event.clear()
 
             while True:
-                prepared = self._worker.prepare_batch()
-                if prepared.dequeued == 0:
+                prepared = await self._form_batch(wake_event)
+                if prepared is None:
                     break
-                if not prepared.requests:
-                    continue
 
                 try:
                     outputs = await asyncio.to_thread(
@@ -147,6 +158,61 @@ class AsyncScheduler(Generic[ResultT]):
                     self._worker.fail_batch(prepared, error)
                 else:
                     self._worker.complete_batch(prepared, outputs)
+
+    async def _form_batch(
+        self,
+        wake_event: asyncio.Event,
+    ) -> PreparedBatch[ResultT] | None:
+        """Collect live FIFO requests until capacity or the first deadline."""
+
+        loop = asyncio.get_running_loop()
+        requests: list[PendingRequest[ResultT]] = []
+        dequeued = 0
+        stale = 0
+        batch_deadline: float | None = None
+
+        while len(requests) < self._worker.max_batch_size:
+            remaining = self._worker.max_batch_size - len(requests)
+            addition = self._worker.prepare_batch(remaining)
+            dequeued += addition.dequeued
+            stale += addition.stale
+
+            if addition.requests:
+                if batch_deadline is None:
+                    batch_deadline = loop.time() + self._max_wait_s
+                requests.extend(addition.requests)
+
+            if len(requests) == self._worker.max_batch_size:
+                break
+
+            if addition.dequeued > 0:
+                # Stale IDs do not consume live capacity. Continue popping so
+                # live requests behind them can fill the same batch.
+                continue
+
+            if not requests:
+                return None
+
+            assert batch_deadline is not None
+            remaining_wait = batch_deadline - loop.time()
+            if remaining_wait <= 0:
+                break
+
+            try:
+                await asyncio.wait_for(
+                    wake_event.wait(),
+                    timeout=remaining_wait,
+                )
+            except asyncio.TimeoutError:
+                break
+            else:
+                wake_event.clear()
+
+        return PreparedBatch(
+            dequeued=dequeued,
+            stale=stale,
+            requests=tuple(requests),
+        )
 
     @staticmethod
     def _consume_task_result(task: asyncio.Task[None]) -> None:
