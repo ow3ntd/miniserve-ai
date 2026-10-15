@@ -6,6 +6,65 @@ retroactive polish.
 
 ---
 
+## 2026-08-12 — Day 7: end-to-end request deadlines
+
+**Done**
+
+- Added domain-specific `RequestDeadlineExceeded` and made the absolute
+  `PendingRequest.deadline` authoritative across the full admitted lifecycle.
+- Exposed validated `request_timeout_s` through `create_app()` and translated
+  deadline expiration to HTTP 504.
+- Exposed the registry's monotonic clock for deadline creation and comparison;
+  asyncio wait durations are derived from the same absolute clock domain.
+- Made dynamic batch waits wake at the earlier of the fixed `max_wait_ms`
+  deadline and the earliest live request deadline.
+- Added queued-request expiration, stale-ID handling, and final pre-dispatch
+  deadline filtering.
+- Supervised all registry-owned deadlines during active model inference,
+  including requests queued behind that invocation.
+- Added selective timeout within a model batch without shifting positional
+  output correspondence; late results for timed-out IDs are safe no-ops.
+- Defined exactly-once result/deadline/cancellation races through the
+  registry's first-successful-removal rule.
+- Hardened scheduler stop to cancel and consume the asyncio inference wrapper
+  without waiting for or pretending to terminate its executor thread.
+- Disambiguated domain `RequestDeadlineExceeded` from `wait_for()` timeout by
+  checking whether the owned future already completed.
+- Final hardened Python suite: **124 passed**. Changed-file compilation and
+  `git diff --check` passed.
+
+**Decisions**
+
+- **One end-to-end deadline, not phase-local timeouts.** Registration creates
+  the single authority used through queueing, formation, inference, and HTTP
+  waiting.
+- **`request_timeout_s` is separate from `max_wait_ms`.** The former bounds the
+  client lifecycle; the latter bounds only batch formation latency.
+- **Timeout is individual, not a whole-batch failure.** One expired request
+  must not fail unrelated batch-mates.
+- **Do not terminate running model threads.** Python cannot forcibly stop an
+  executor thread safely; timed-out ownership is removed and late output is
+  ignored instead.
+- **Terminal stop prevents restart-created overlap.** A stopped scheduler
+  cannot launch a new model call beside an old thread still finishing.
+- **Own and consume wrapper tasks.** Explicit cancellation and awaiting avoids
+  unhandled asyncio task exceptions after stop.
+
+**Deferred**
+
+- Graceful drain of queued and in-flight work.
+- Metrics and structured tracing.
+- Scheduler/open-loop benchmarks.
+- Multiple workers and GPU serving.
+
+No benchmark results or production-readiness claims were added.
+
+**Next**
+
+- Implement graceful bounded shutdown and drain behavior.
+
+---
+
 ## 2026-08-11 — Day 6: dynamic batch formation
 
 **Done**

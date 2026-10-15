@@ -227,3 +227,24 @@ def test_concurrent_predict_requests_share_one_dynamic_batch():
     assert second_response.json()["outputs"] == [22.0] * runner.config.n_outputs
     assert len(runner.calls) == 1
     assert sorted(runner.calls[0]) == [(11,), (22,)]
+
+
+def test_predict_returns_504_when_request_deadline_expires():
+    class SlowRunner(ModelRunner):
+        def predict(self, batch):
+            time.sleep(0.15)
+            return super().predict(batch)
+
+    runner = SlowRunner()
+    runner.load()
+    application = create_app(
+        runner,
+        max_batch_size=1,
+        request_timeout_s=0.04,
+    )
+
+    with TestClient(application) as client:
+        response = client.post("/predict", json={"tokens": VALID_TOKENS})
+
+    assert response.status_code == 504
+    assert response.json()["detail"] == "request deadline exceeded"

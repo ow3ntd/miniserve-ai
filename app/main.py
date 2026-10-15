@@ -9,6 +9,7 @@ from app.admission import QueueFullError
 from app.model_runner import ModelRunner
 from app.scheduler import AsyncScheduler
 from app.schemas import PredictRequest, PredictResponse
+from app.request_registry import RequestDeadlineExceeded
 
 APP_NAME = "miniserve-ai"
 VERSION = "0.1.0.dev0"
@@ -23,6 +24,7 @@ def create_app(
     queue_capacity: int = 128,
     max_batch_size: int = 8,
     max_wait_ms: float = 0,
+    request_timeout_s: float = 30.0,
 ) -> FastAPI:
     """Application factory.
 
@@ -42,6 +44,7 @@ def create_app(
         queue_capacity=queue_capacity,
         max_batch_size=max_batch_size,
         max_wait_ms=max_wait_ms,
+        request_timeout_s=request_timeout_s,
     )
 
     @asynccontextmanager
@@ -97,6 +100,8 @@ def create_app(
 
         try:
             outputs = await scheduler.wait(pending)
+        except RequestDeadlineExceeded as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
         except ValueError as exc:
             # Model-dependent validation the schema can't know about
             # (e.g. token ids outside the model's vocab size).

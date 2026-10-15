@@ -12,7 +12,11 @@ import miniserve_core
 
 from app.admission import AdmissionController
 from app.batch_worker import BatchModel, FixedBatchWorker, PreparedBatch
-from app.request_registry import PendingRequest, RequestRegistry
+from app.request_registry import (
+    PendingRequest,
+    RequestDeadlineExceeded,
+    RequestRegistry,
+)
 
 
 ResultT = TypeVar("ResultT")
@@ -30,8 +34,15 @@ class AsyncScheduler(Generic[ResultT]):
         max_wait_ms: float = 0,
         request_timeout_s: float = 30.0,
     ) -> None:
-        if request_timeout_s <= 0:
-            raise ValueError("request_timeout_s must be greater than zero")
+        if (
+            not isinstance(request_timeout_s, Real)
+            or isinstance(request_timeout_s, bool)
+            or not math.isfinite(request_timeout_s)
+            or request_timeout_s <= 0
+        ):
+            raise ValueError(
+                "request_timeout_s must be a finite positive number"
+            )
         if (
             not isinstance(max_wait_ms, Real)
             or isinstance(max_wait_ms, bool)
@@ -127,9 +138,28 @@ class AsyncScheduler(Generic[ResultT]):
         return request
 
     async def wait(self, request: PendingRequest[ResultT]) -> ResultT:
-        """Await a result without giving caller cancellation its future."""
+        """Await one result while enforcing its absolute request deadline."""
 
         try:
+            remaining = request.deadline - self._registry.now()
+            if remaining <= 0:
+                self._expire(request)
+            else:
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.shield(request.future),
+                        timeout=remaining,
+                    )
+                except asyncio.TimeoutError:
+                    # RequestDeadlineExceeded is also a TimeoutError. If the
+                    # owned future completed, propagate its winning outcome;
+                    # only a still-pending future means wait_for timed out.
+                    if request.future.done():
+                        return await asyncio.shield(request.future)
+                    self._expire(request)
+
+            # Timeout and result completion may become runnable together. The
+            # registry removal that succeeded owns the outcome.
             return await asyncio.shield(request.future)
         except asyncio.CancelledError:
             self._registry.cancel(request.request_id)
@@ -149,15 +179,7 @@ class AsyncScheduler(Generic[ResultT]):
                 if prepared is None:
                     break
 
-                try:
-                    outputs = await asyncio.to_thread(
-                        self._worker.predict,
-                        prepared.inputs,
-                    )
-                except Exception as error:
-                    self._worker.fail_batch(prepared, error)
-                else:
-                    self._worker.complete_batch(prepared, outputs)
+                await self._execute_batch(prepared, wake_event)
 
     async def _form_batch(
         self,
@@ -165,7 +187,6 @@ class AsyncScheduler(Generic[ResultT]):
     ) -> PreparedBatch[ResultT] | None:
         """Collect live FIFO requests until capacity or the first deadline."""
 
-        loop = asyncio.get_running_loop()
         requests: list[PendingRequest[ResultT]] = []
         dequeued = 0
         stale = 0
@@ -178,9 +199,19 @@ class AsyncScheduler(Generic[ResultT]):
             stale += addition.stale
 
             if addition.requests:
+                live_additions = self._expire_and_filter(
+                    addition.requests
+                )
                 if batch_deadline is None:
-                    batch_deadline = loop.time() + self._max_wait_s
-                requests.extend(addition.requests)
+                    if live_additions:
+                        batch_deadline = (
+                            self._registry.now() + self._max_wait_s
+                        )
+                requests.extend(live_additions)
+
+            requests = self._expire_and_filter(requests)
+            if not requests:
+                batch_deadline = None
 
             if len(requests) == self._worker.max_batch_size:
                 break
@@ -194,9 +225,19 @@ class AsyncScheduler(Generic[ResultT]):
                 return None
 
             assert batch_deadline is not None
-            remaining_wait = batch_deadline - loop.time()
+            request_deadline = min(
+                request.deadline for request in requests
+            )
+            wait_deadline = min(batch_deadline, request_deadline)
+            remaining_wait = wait_deadline - self._registry.now()
             if remaining_wait <= 0:
-                break
+                requests = self._expire_and_filter(requests)
+                if not requests:
+                    batch_deadline = None
+                    continue
+                if self._registry.now() >= batch_deadline:
+                    break
+                continue
 
             try:
                 await asyncio.wait_for(
@@ -204,7 +245,12 @@ class AsyncScheduler(Generic[ResultT]):
                     timeout=remaining_wait,
                 )
             except asyncio.TimeoutError:
-                break
+                requests = self._expire_and_filter(requests)
+                if not requests:
+                    batch_deadline = None
+                    continue
+                if self._registry.now() >= batch_deadline:
+                    break
             else:
                 wake_event.clear()
 
@@ -212,6 +258,105 @@ class AsyncScheduler(Generic[ResultT]):
             dequeued=dequeued,
             stale=stale,
             requests=tuple(requests),
+        )
+
+    async def _execute_batch(
+        self,
+        prepared: PreparedBatch[ResultT],
+        wake_event: asyncio.Event,
+    ) -> None:
+        """Run one model call while expiring its requests independently."""
+
+        live = self._expire_and_filter(prepared.requests)
+        if not live:
+            return
+
+        dispatched = PreparedBatch(
+            dequeued=prepared.dequeued,
+            stale=prepared.stale,
+            requests=tuple(live),
+        )
+        inference = asyncio.create_task(
+            asyncio.to_thread(
+                self._worker.predict,
+                dispatched.inputs,
+            ),
+            name="miniserve-inference",
+        )
+
+        try:
+            while not inference.done():
+                # The scheduler cannot dequeue another batch while this model
+                # call is active, but queued requests' clocks keep running.
+                # Supervise all registry-owned requests with one timer loop.
+                owned = list(self._registry.pending())
+                if owned:
+                    remaining = min(
+                        request.deadline for request in owned
+                    ) - self._registry.now()
+                else:
+                    remaining = None
+
+                if remaining is not None and remaining <= 0:
+                    self._expire_and_filter(owned)
+                    continue
+
+                admission = asyncio.create_task(wake_event.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        {inference, admission},
+                        timeout=remaining,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if inference in done:
+                        break
+                    if admission in done:
+                        wake_event.clear()
+                    else:
+                        self._expire_and_filter(owned)
+                finally:
+                    admission.cancel()
+                    try:
+                        await admission
+                    except asyncio.CancelledError:
+                        pass
+
+            try:
+                outputs = await inference
+            except Exception as error:
+                self._worker.fail_batch(dispatched, error)
+            else:
+                self._worker.complete_batch(dispatched, outputs)
+        except asyncio.CancelledError:
+            # This cancels only the asyncio wrapper. The executor thread may
+            # continue, but its wrapper is owned, awaited, and cannot leak an
+            # un-retrieved task exception.
+            inference.cancel()
+            try:
+                await inference
+            except asyncio.CancelledError:
+                pass
+            raise
+
+    def _expire_and_filter(
+        self,
+        requests: Sequence[PendingRequest[ResultT]],
+    ) -> list[PendingRequest[ResultT]]:
+        """Expire due requests and return entries still owned by registry."""
+
+        now = self._registry.now()
+        live: list[PendingRequest[ResultT]] = []
+        for request in requests:
+            if now >= request.deadline:
+                self._expire(request)
+            if self._registry.get(request.request_id) is request:
+                live.append(request)
+        return live
+
+    def _expire(self, request: PendingRequest[ResultT]) -> bool:
+        return self._registry.fail(
+            request.request_id,
+            RequestDeadlineExceeded("request deadline exceeded"),
         )
 
     @staticmethod

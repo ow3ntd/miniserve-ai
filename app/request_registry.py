@@ -22,6 +22,10 @@ ResultT = TypeVar("ResultT")
 UINT64_MAX = (1 << 64) - 1
 
 
+class RequestDeadlineExceeded(TimeoutError):
+    """Raised when an admitted request's end-to-end deadline expires."""
+
+
 @dataclass(frozen=True, slots=True)
 class PendingRequest(Generic[ResultT]):
     """State owned by Python for one admitted inference request."""
@@ -87,6 +91,16 @@ class RequestRegistry(Generic[ResultT]):
         """Return a pending request without removing it."""
 
         return self._requests.get(request_id)
+
+    def now(self) -> float:
+        """Return time in the same monotonic domain as stored deadlines."""
+
+        return self._clock()
+
+    def pending(self) -> tuple[PendingRequest[ResultT], ...]:
+        """Return a stable event-loop-thread snapshot of pending requests."""
+
+        return tuple(self._requests.values())
 
     def resolve(self, request_id: int, result: ResultT) -> bool:
         """Resolve and remove a request exactly once.
