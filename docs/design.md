@@ -264,8 +264,12 @@ start, environment logging, AC power, and no access logging. Methodology is in
 [`results/benchmark_summary.md`](../results/benchmark_summary.md) and the
 environment in [`results/environment.md`](../results/environment.md).
 
-Those measurements cover the older synchronous, unbatched baseline. No Day 7
-scheduler benchmark has been recorded.
+The 2026-10-15 sweep ([`results/scheduler_sweep.md`](../results/scheduler_sweep.md))
+measured the scheduler itself, using a multi-process closed-loop generator
+calibrated at ~35k req/s against `GET /health` so that server numbers can be
+read as server numbers. The Day 4 figure of ~1,700 req/s was the previous
+single-process generator's ceiling, not server saturation; the correction is
+recorded in `results/benchmark_summary.md`.
 
 ## 10. Limitations
 
@@ -273,6 +277,5 @@ scheduler benchmark has been recorded.
 - Shutdown is terminal cancellation rather than graceful drain.
 - A running inference thread may finish after stop.
 - Queued native IDs are not drained during shutdown.
-- Metrics, tracing, and scheduler/open-loop benchmarks remain planned.
+- Metrics, tracing, and open-loop benchmarks remain planned.
 - Multiple scheduler workers and GPU serving are not implemented.
-- Existing measured results cover the older synchronous baseline.
