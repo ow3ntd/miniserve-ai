@@ -6,6 +6,147 @@ retroactive polish.
 
 ---
 
+## 2026-10-15 — Day 8: scheduler sweep, load-generator collapse, corrected baseline
+
+**Done**
+
+- Instrumentation for benchmarking (committed as `0e20563`): `AsyncScheduler`
+  counts `batches_dispatched` / `requests_dispatched` (live requests in
+  model calls only; all-stale skipped batches don't count); `GET /stats`
+  returns both, their ratio as `mean_batch_size`, and the effective config;
+  the module-level `app` reads `MINISERVE_QUEUE_CAPACITY`,
+  `MINISERVE_MAX_BATCH_SIZE`, `MINISERVE_MAX_WAIT_MS`,
+  `MINISERVE_REQUEST_TIMEOUT_S` with `create_app()`'s signature unchanged.
+  10 new tests; suite at **134 passed**.
+- `load_tests/sweep_scheduler.py`: max_batch_size ∈ {1, 8, 32} ×
+  max_wait_ms ∈ {0, 1, 5} × closed-loop c ∈ {1, 8, 32}; one fresh uvicorn
+  per config via env vars (`MINISERVE_QUEUE_CAPACITY=256`), 50 warmup,
+  6 trials × 500 requests per cell with the first trial discarded as cold,
+  `/stats` differenced around each trial for realized batch size. Verifies
+  the server picked up its config before sending load.
+- First sweep, with the asyncio/httpx generator: every c=32 cell with
+  max_batch_size > 1 collapsed (~600 req/s, p99 > 200 ms, realized batch
+  ~1.08) and several were bimodal (single trials at ~1,800 req/s). Those
+  results are kept as evidence under
+  `results/superseded/scheduler_sweep_httpx_2026-10-15.{md,csv}`.
+- Diagnosis (no code changes kept; trace instrumentation applied behind
+  `MINISERVE_TRACE=1`, then reverted):
+  - httpx `Limits(max_connections=64, max_keepalive_connections=64)` did
+    not remove the collapse; it got worse (390 req/s, p99 > 350 ms).
+  - Per-batch trace: queue depth at pop was 1 for 96–98% of batches;
+    supervision-loop iterations in `_execute_batch` were 1 for 91–94% of
+    batches and never above 4; formation 6 µs; event-loop lag probe p99
+    ≈ 45 µs (loop idle); 1.3 ms p50 idle gap between batches waiting for
+    the next admit. Per-request: client-send → handler-entry 15.4 ms p50 /
+    221 ms p99; everything inside the handler 0.25 ms p50. In-handler
+    concurrency was 1 for 79% of requests (vs. ≥ 2 for 65% at
+    max_batch_size=1).
+  - Kernel socket sampling (`netstat`) during a slow trial: server-side
+    Recv-Q = 0 in every sample, client-side Send-Q = 0. Established
+    connections pinned at exactly 20 = httpx's default
+    `max_keepalive_connections`; with max_batch_size=1 they churned 17–31.
+  - Controls: `OMP_NUM_THREADS=1` (no change); uvicorn `--loop asyncio
+    --http h11` instead of uvloop/httptools (no change).
+  - Replacing the client with 32 OS threads on persistent `http.client`
+    connections: the "collapsed" cell served **10,227 ± 112 req/s**,
+    p50 2.94 ms, p99 3.86 ms, realized batch 7.67; max_batch_size=1 gave
+    3,467 ± 749 req/s. The scheduler was never the problem.
+- `load_tests/load_test.py` rewritten around that design: W workers, one
+  persistent HTTP/1.1 connection each, closed-loop, same CLI and trial /
+  warmup / percentile structure, `run_trial()` kept as the import the
+  sweep uses. Added `--method GET` and repeatable `--url` for calibration,
+  and `--processes` after calibration showed one CPython process tops out
+  at 24–27k req/s (GIL-bound).
+- Generator calibrated against `GET /health` (recorded with exact commands
+  in `results/environment.md`): 35,068 ± 2,062 req/s at c=32 against one
+  uvicorn (uvicorn's event loop near one core is the limiter there);
+  42,113 ± 1,612 req/s against two uvicorns (3.5 client cores). Both
+  clear the ~3× rule against the best scheduler cell (11,359 req/s → 3.1×).
+- Sweep re-run with the new generator (`results/scheduler_sweep.md`,
+  raw CSV alongside): 162 trials, 0 errors, 104 s. Headlines, c=32:
+  max_batch=1 4,297 ± 133 req/s p50 7.19 ms; max_batch=8 w=0
+  11,164 ± 96 req/s p50 2.75 ms p99 4.47 ms, realized batch 7.87;
+  max_batch=32 w=5 realized batch 31.6. c=1: ~3,050–3,185 req/s at w=0
+  for every max_batch, and the expected full-window penalty when
+  max_wait_ms > 0 with a single client (430 and 129 req/s).
+- `results/benchmark_summary.md`: Day 4 table kept and labeled historical;
+  its "server saturates ~1,700 req/s" interpretation replaced with the
+  finding that this was the httpx generator's ceiling, confirmed today.
+  Interpretation of the new sweep deliberately not written yet.
+
+**Decisions**
+
+- **Replace the generator rather than tune httpx.** The collapse was a
+  property of one event loop plus one connection pool serving 32
+  closed-loop workers; raising pool limits made it worse. OS threads
+  (and processes) with private persistent connections have no shared
+  state a slow worker can stall. The threaded design is also what proved
+  the server healthy, so the production generator is the instrument that
+  was already validated.
+- **Calibrate the generator and record the ceiling before trusting any
+  server number.** Rule adopted: single-server `GET /health` ceiling at
+  c=32 must be ≥ ~3× the best scheduler cell. The first threaded version
+  (one process) came in at 27.3k vs. 10.2k = 2.7×, so it went
+  multi-process (`--processes 4` default in the sweep) before the re-run.
+- **Two ceilings are recorded, and they mean different things.** ~35k
+  req/s against one uvicorn is the HTTP layer's ceiling and bounds every
+  `/predict` number; ≥ 42k against two uvicorns is the generator's. Only
+  the second is a client limit.
+- **Discard the first trial of every cell, not just of every server.**
+  One server serves c=1, 8, 32 in sequence; the first cell absorbs
+  process cold start and later cells absorb the concurrency step. Treating
+  them alike keeps the reported sample size uniform (5 of 6).
+- **Keep superseded results, don't rewrite them.** Same rule as
+  `performance_history.md`: the httpx numbers stay as evidence with a
+  header saying what they measured.
+- **Do not present the httpcore pool mechanism as established.** The
+  pinned-at-20 observation and a reading of httpcore 1.0.9's idle-pruning
+  code (`_assign_requests_to_connections` appears to count all
+  connections, not idle ones, when deciding to close an idle connection)
+  are *consistent with* the churn seen; they were not traced to the
+  bimodality instruction by instruction, and the fix did not depend on
+  them.
+
+**Problems**
+
+- Two hypotheses rejected by measurement before the right one: event-loop
+  starvation from the supervision loop's per-admission task churn (1
+  iteration per batch in >90% of batches; loop idle), and torch OpenMP
+  threads spinning after batches > 1 (`OMP_NUM_THREADS=1` changed
+  nothing).
+- The Day 4 baseline's central claim was wrong for three months. Its
+  Little's Law check "closed" only because the in-system time it used was
+  dominated by the generator. The httpx c=1 rows were also inflated by
+  client overhead (p50 0.69 ms vs. 0.33 ms with the threaded client), so
+  none of the httpx rows are quoted.
+- uvicorn's single event loop caps the HTTP layer near 35k req/s here, so
+  the sweep's top cells (~11k req/s) sit at roughly a third of that
+  ceiling; the margin is adequate for this grid but not for much larger
+  batches or a faster model.
+- Several c=32 cells with max_wait_ms=5 (and max_batch=1 w=5) have one
+  outlier trial each, visible as p99 stddevs as large as their means
+  (e.g. 13.62 ± 20.85 ms). Raw rows are in the CSV; whether to report
+  medians is an interpretation question for the write-up.
+- The re-run necessarily executed on a dirty tree (`0e20563-dirty`)
+  because results were reviewed before the generator/sweep commit;
+  `environment.md` records this.
+- Unrelated but relevant to benchmark hygiene: an 8-day-old orphaned
+  profiling script from another session was pinning one core until it
+  was killed before the first run.
+
+**Next**
+
+- Write the sweep interpretation (README, `docs/design.md`,
+  `results/benchmark_summary.md`, `performance_history.md` entry) with
+  the numbers now in hand; decide how to present the outlier trials.
+- Consider an open-loop generator for overload experiments; the closed
+  loop cannot exceed the server's rate by construction.
+- Before citing the httpcore behavior anywhere, check whether it is a
+  known or already-fixed upstream issue.
+- Graceful bounded shutdown and drain (carried from Day 7).
+
+---
+
 ## 2026-08-12 — Day 7: end-to-end request deadlines
 
 **Done**
