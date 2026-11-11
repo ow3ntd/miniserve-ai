@@ -66,7 +66,13 @@ class AsyncScheduler(Generic[ResultT]):
             max_batch_size=max_batch_size,
         )
         self._request_timeout_s = request_timeout_s
-        self._max_wait_s = float(max_wait_ms) / 1_000.0
+        self._max_wait_ms = float(max_wait_ms)
+        self._max_wait_s = self._max_wait_ms / 1_000.0
+        # Dispatch counters. Incremented only on the event-loop thread, so no
+        # locking is needed. Batches whose members all expired before the
+        # model call are never dispatched and are not counted.
+        self._batches_dispatched = 0
+        self._requests_dispatched = 0
         self._wake_event: asyncio.Event | None = None
         self._task: asyncio.Task[None] | None = None
         self._stopped = False
@@ -78,6 +84,34 @@ class AsyncScheduler(Generic[ResultT]):
     @property
     def is_running(self) -> bool:
         return self._task is not None and not self._task.done()
+
+    @property
+    def queue_capacity(self) -> int:
+        return self._queue.capacity
+
+    @property
+    def max_batch_size(self) -> int:
+        return self._worker.max_batch_size
+
+    @property
+    def max_wait_ms(self) -> float:
+        return self._max_wait_ms
+
+    @property
+    def request_timeout_s(self) -> float:
+        return self._request_timeout_s
+
+    @property
+    def batches_dispatched(self) -> int:
+        """Number of model calls issued so far."""
+
+        return self._batches_dispatched
+
+    @property
+    def requests_dispatched(self) -> int:
+        """Number of live requests included in those model calls."""
+
+        return self._requests_dispatched
 
     async def start(self) -> None:
         """Start the sole background task, idempotently until stopped."""
@@ -276,6 +310,8 @@ class AsyncScheduler(Generic[ResultT]):
             stale=prepared.stale,
             requests=tuple(live),
         )
+        self._batches_dispatched += 1
+        self._requests_dispatched += len(live)
         inference = asyncio.create_task(
             asyncio.to_thread(
                 self._worker.predict,
