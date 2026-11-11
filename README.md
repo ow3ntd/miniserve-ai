@@ -6,7 +6,7 @@
 
 The model is incidental; the scheduler is the point.
 
-> **Status: v0.1 in progress — Day 7 end-to-end request deadlines and HTTP 504 are implemented.** Graceful draining, metrics, tracing, and scheduler benchmarks remain planned.
+> **Status: v0.1 in progress — Day 8: scheduler benchmarked with a calibrated load generator.** Graceful draining, metrics, and tracing remain planned.
 
 ## Why this project exists
 
@@ -54,7 +54,7 @@ Expired requests are removed individually, so they do not poison batch-mates. Th
 - [x] Per-request future routing and request-cancellation cleanup
 - [x] Model inference offloaded from the asyncio event loop and serialized
 - [x] Pre-admission model-specific validation
-- [x] Reproducible closed-loop baseline benchmark
+- [x] Calibrated multi-process load generator and measured scheduler sweep (see Benchmarks)
 - [x] CI with native/Python tests plus sanitizer builds
 - [ ] Deliberate concurrency bug hunt, documented in `docs/concurrency_bugs.md`
 - [ ] Graceful bounded shutdown and drain
@@ -94,9 +94,23 @@ assert queue.pop_batch(2) == [101, 102]
 
 ## Benchmarks
 
-The current measured baseline is synchronous and unbatched. On the recorded Apple M4 environment, c=1 measured 1583.8 ± 59.2 req/s with 0.61 ms p50; c=8 measured 1712.2 ± 47.2 req/s with 3.09 ms p50 and 23.25 ms p99. Full methodology and caveats are in [`results/benchmark_summary.md`](results/benchmark_summary.md).
+Apple M4 (10 cores), macOS 26.2, Python 3.12, torch 2.13; closed-loop load, 5 trials after a discarded cold trial, mean ± sample stddev. Full grid and methodology: [`results/scheduler_sweep.md`](results/scheduler_sweep.md); environment and the load generator's measured ceiling: [`results/environment.md`](results/environment.md).
 
-These are the older synchronous, unbatched baseline results. The C++ queue and scheduler are now integrated into `/predict`, but no newer measured scheduler benchmark has been recorded, so these numbers are **not** queue or batching results.
+Headline at c=32 closed-loop clients, 2026-10-15:
+
+| Configuration | req/s | p50 (ms) | p99 (ms) | realized batch |
+|---|---:|---:|---:|---:|
+| max_batch=1 (no batching) | 4,297 ± 133 | 7.19 | 9.01 | 1.00 |
+| max_batch=8, max_wait=0 | 11,164 ± 96 | 2.75 | 4.47 | 7.87 |
+
+Dynamic batching raises throughput 2.6× and cuts p50 2.6× at the same offered load.
+
+- Batches fill from queue depth, not from waiting: at c=32, max_wait=0 already realizes 7.87 of 8; a nonzero max_wait adds tail latency and no throughput.
+- max_wait_ms is a latency floor whenever offered concurrency is below max_batch_size (c=1, batch=8, wait=5: 130 req/s, p50 7.7 ms); choose it against the expected arrival rate.
+- Little throughput beyond batch ≈ 8 on this model: batch=32 fills to 31.6 at c=32 but gains at most ~10% over batch=8; the ~0.7 ms per-batch cycle is scheduler/HTTP overhead, not the ~0.2–0.5 ms model call. A heavier model shifts this.
+- Little's law closes non-circularly: 32 / 11,164 req/s = 2.87 ms against a measured p50 of 2.75 ms, with the generator's ceiling independently measured at ~35k req/s.
+
+The Day 4 figure of ~1,700 req/s was the previous single-process generator's ceiling, not server saturation — corrected 2026-10-15 in [`results/benchmark_summary.md`](results/benchmark_summary.md).
 
 ## HTTP outcomes
 
@@ -111,7 +125,7 @@ These are the older synchronous, unbatched baseline results. The C++ queue and s
 - Shutdown is terminal cancellation, not graceful drain. A scheduler cannot restart after `stop()`.
 - Cancelling the owned asyncio inference wrapper does not terminate an executor thread already running model inference. The wrapper is explicitly cancelled and consumed so it cannot leak an unhandled task exception, but the thread may finish after scheduler stop.
 - Queued and in-flight work is not gracefully drained during shutdown.
-- Metrics, tracing, scheduler/open-loop benchmarks, multiple workers, and GPU serving remain to be implemented. Existing benchmark results measure the older synchronous baseline.
+- Metrics, tracing, open-loop benchmarks, multiple workers, and GPU serving remain to be implemented. Benchmarks use a tiny in-repo model; per-batch overhead, not compute, bounds throughput.
 - Not production-ready and not claimed to be; this is a concurrency-first serving lab.
 
 ## Next milestone
