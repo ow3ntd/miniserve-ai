@@ -6,7 +6,7 @@
 
 The model is incidental; the scheduler is the point.
 
-> **Status: v0.1 in progress — Day 8: scheduler benchmarked with a calibrated load generator.** Graceful draining, metrics, and tracing remain planned.
+> **Status: v0.1.0.** Bounded C++ queue, dynamic-batching scheduler, end-to-end deadlines, and a measured scheduler sweep are in place. Graceful draining, metrics, and tracing are planned for v0.2 (see [Roadmap](#v02-roadmap)).
 
 ## Why this project exists
 
@@ -128,6 +128,17 @@ The Day 4 figure of ~1,700 req/s was the previous single-process generator's cei
 - Metrics, tracing, open-loop benchmarks, multiple workers, and GPU serving remain to be implemented. Benchmarks use a tiny in-repo model; per-batch overhead, not compute, bounds throughput.
 - Not production-ready and not claimed to be; this is a concurrency-first serving lab.
 
-## Next milestone
+## v0.2 roadmap
 
-Implement graceful bounded shutdown and drain behavior for queued and in-flight work.
+In planned order:
+
+1. **Graceful bounded shutdown and drain.** Stop admitting, finish or time out queued and in-flight work within a bounded window, and replace today's terminal cancellation.
+2. **Deliberate concurrency bug hunt.** Induce, reproduce, and fix race conditions in the queue and scheduler, documented in `docs/concurrency_bugs.md`.
+3. **Observability.** Prometheus `/metrics` and structured tracing with correlation IDs.
+4. **Open-loop overload tests and recorded trace replay.** Measure behavior when arrivals do not slow down with the server, complementing the closed-loop sweep.
+
+Multiple workers, GPU serving, and distributed deployment stay out of scope for v0.2.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
